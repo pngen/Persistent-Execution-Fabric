@@ -339,12 +339,22 @@ AuditReport audit_state(const DurableState& state) {
                 break;
             }
         }
-        for (std::size_t i = 1; i < committed.size(); ++i) {
-            if (committed[i]->ordinal <= committed[i - 1]->ordinal) {
-                add(report, "PROGRESS_ORDINAL_NOT_MONOTONIC",
-                    "committed progress ordinals do not strictly increase", id);
-                break;
-            }
+        // Actions may be completed in any order, so committed ordinals need not
+        // increase. What must never happen is the same ordinal committing twice:
+        // that would mean one logical action produced two logical transitions.
+        std::vector<std::uint64_t> ordinals;
+        ordinals.reserve(committed.size());
+        for (const ProgressRecord* progress : committed) {
+            ordinals.push_back(progress->ordinal);
+        }
+        std::sort(ordinals.begin(), ordinals.end());
+        if (std::adjacent_find(ordinals.begin(), ordinals.end()) != ordinals.end()) {
+            add(report, "PROGRESS_ORDINAL_DUPLICATE",
+                "two committed progress records share an action ordinal", id);
+        }
+        if (ordinals.empty() && execution.action_frontier != 0 && committed.empty()) {
+            // No commits at all is legal: an execution may have dispatched work
+            // that has not yet been made authoritative.
         }
         if (committed.size() != execution.committed_actions) {
             add(report, "COMMITTED_ACTION_COUNT_MISMATCH",
