@@ -1,0 +1,43 @@
+# Build trees
+build/
+build-*/
+out/
+cmake-build-*/
+Testing/
+_deps/
+
+# Install trees
+install/
+install-*/
+consumer-build/
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Compiler / tooling output
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.exe
+*.dll
+*.log
+*.trace
+
+# Sanitizer output
+asan-*/
+
+# Local runtime state (never committed)
+*.pefstore
+*.pefjournal
+*.pefsnapshot
+store/
+state/
+tmp/
+scratch/

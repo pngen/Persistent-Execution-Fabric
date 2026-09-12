@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+include("${CMAKE_CURRENT_LIST_DIR}/PersistentExecutionFabricTargets.cmake")
+
+check_required_components(PersistentExecutionFabric)
+
+set(PersistentExecutionFabric_VERSION "@PROJECT_VERSION@")
+set(PersistentExecutionFabric_PROTOCOL_VERSION "1")
+set(PersistentExecutionFabric_PERSISTENCE_SCHEMA_VERSION "1")
