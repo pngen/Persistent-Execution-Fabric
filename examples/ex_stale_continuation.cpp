@@ -22,7 +22,7 @@ int main() {
         }
         CallerContext caller{SessionId{}, opened.epoch};
         CreateExecutionRequest create;
-        create.request = RequestId{1};
+        create.request = next_request();
         create.policy = example_policy();
         CreateExecutionResult created;
         if (const Status status = runtime.create_execution(caller, create, created); !status.ok()) {
@@ -49,7 +49,7 @@ int main() {
             return fail(status);
         }
         RegisterCheckpointRequest checkpoint;
-        checkpoint.request = RequestId{100};
+        checkpoint.request = next_request();
         checkpoint.token = bound.token;
         checkpoint.expected_checkpoint_generation = CheckpointGeneration{};
         checkpoint.content_size = 512;
@@ -105,7 +105,7 @@ int main() {
         return fail(status);
     }
     RecoveryOutcome recovered;
-    if (const Status status = runtime.recover(caller, RequestId{200}, execution, recovered);
+    if (const Status status = runtime.recover(caller, next_request(), execution, recovered);
         !status.ok()) {
         return fail(status);
     }

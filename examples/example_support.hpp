@@ -2,6 +2,7 @@
 // Copyright 2026 Summon Software Labs. Apache License 2.0.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -45,6 +46,17 @@ inline int fail(const Status& status) {
     return 1;
 }
 
+// Request identities are client-scoped in the fabric: reusing one returns the
+// cached reply of the earlier request instead of performing the operation
+// again. Examples therefore mint a fresh identity for every request.
+[[nodiscard]] inline RequestId next_request() {
+    static std::atomic<std::uint64_t> counter{0};
+    HashBuilder builder;
+    builder.u64(0x9001);
+    builder.u64(counter.fetch_add(1, std::memory_order_relaxed) + 1);
+    return RequestId{builder.digest()};
+}
+
 // A worker binding with a live lease, used by every example.
 struct Bound {
     ExecutionId execution;
@@ -61,7 +73,7 @@ inline Status bind_worker(Runtime& runtime, const CallerContext& caller, Executi
     out.worker = derive_worker_id(name);
     out.boot = mint_worker_boot_id(out.worker);
     BindWorkerRequest request;
-    request.request = RequestId{0x1000 + execution.value() % 1000};
+    request.request = next_request();
     request.execution = execution;
     request.worker = out.worker;
     request.boot = out.boot;
@@ -106,17 +118,16 @@ inline Status ensure_running(Runtime& runtime, const CallerContext& caller, Boun
     }
     if (view.execution.lifecycle == Lifecycle::Ready) {
         StartRequest start;
-        start.request = RequestId{bound.execution.value() % 997 + 1};
+        start.request = next_request();
         start.token = bound.token;
         return runtime.start(start);
     }
     if (view.execution.lifecycle == Lifecycle::RecoveryRequired) {
         RecoveryOutcome recovered;
-        PEF_TRY(runtime.recover(caller, RequestId{bound.execution.value() % 991 + 1},
-                                bound.execution, recovered));
+        PEF_TRY(runtime.recover(caller, next_request(), bound.execution, recovered));
     }
     ResumeRequest resume;
-    resume.request = RequestId{bound.execution.value() % 983 + 1};
+    resume.request = next_request();
     resume.token = bound.token;
     resume.observed_bindings = view.execution.bindings;
     resume.revalidate_bindings = revalidate_bindings;
@@ -127,7 +138,7 @@ inline Status ensure_running(Runtime& runtime, const CallerContext& caller, Boun
 inline Status commit_one(Runtime& runtime, Bound& bound, SideEffectClass cls,
                          std::uint64_t ordinal_hint, CompleteActionResult& out) {
     BeginActionRequest begin;
-    begin.request = RequestId{0x2000 + ordinal_hint * 2};
+    begin.request = next_request();
     begin.token = bound.token;
     begin.effect_class = cls;
     begin.evidence.kind = EvidenceKind::Real;
@@ -138,7 +149,7 @@ inline Status commit_one(Runtime& runtime, Bound& bound, SideEffectClass cls,
     BeginActionResult action;
     PEF_TRY(runtime.begin_action(begin, action));
     CompleteActionRequest complete;
-    complete.request = RequestId{0x2001 + ordinal_hint * 2};
+    complete.request = next_request();
     complete.token = bound.token;
     complete.action = action.action;
     complete.action_generation = action.action_generation;

@@ -24,7 +24,7 @@ int main() {
         }
         CallerContext caller{SessionId{}, opened.epoch};
         CreateExecutionRequest create;
-        create.request = RequestId{1};
+        create.request = next_request();
         create.policy = example_policy();
         CreateExecutionResult created;
         if (const Status status = runtime.create_execution(caller, create, created); !status.ok()) {
@@ -55,7 +55,7 @@ int main() {
             return fail(status);
         }
         RegisterCheckpointRequest checkpoint;
-        checkpoint.request = RequestId{100};
+        checkpoint.request = next_request();
         checkpoint.token = bound.token;
         checkpoint.expected_checkpoint = view.execution.checkpoint;
         checkpoint.expected_checkpoint_generation = view.execution.checkpoint_generation;

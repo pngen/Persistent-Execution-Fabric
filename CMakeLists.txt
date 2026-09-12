@@ -151,6 +151,9 @@ if(PEF_BUILD_EXAMPLES)
         target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)
         target_link_libraries(${target_name} PRIVATE pef)
         pef_apply_warnings(${target_name})
+        if(PEF_BUILD_TESTS)
+            add_test(NAME ${target_name} COMMAND ${target_name})
+        endif()
     endfunction()
 
     pef_add_example(pef_example_create_persist examples/ex_create_persist.cpp)
@@ -162,12 +165,6 @@ if(PEF_BUILD_EXAMPLES)
     pef_add_example(pef_example_coordinator_restart examples/ex_coordinator_restart.cpp)
     pef_add_example(pef_example_installed_consumer examples/ex_installed_consumer.cpp)
 
-    if(PEF_BUILD_TESTS)
-        add_test(NAME pef_examples COMMAND ${CMAKE_COMMAND}
-            -DPEF_BIN_DIR=$<TARGET_FILE_DIR:pef_example_create_persist>
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunExamples.cmake)
-        set_tests_properties(pef_examples PROPERTIES TIMEOUT 300)
-    endif()
 endif()
 
 # ---------------------------------------------------------------------------

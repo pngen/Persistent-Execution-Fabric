@@ -14,7 +14,7 @@ Status prepare_interrupted(Runtime& runtime, const CallerContext& caller,
                            SideEffectClass cls, ExecutionId& execution, ActionId& action_id,
                            ActionGeneration& action_generation) {
     CreateExecutionRequest create;
-    create.request = RequestId{1};
+    create.request = next_request();
     create.policy = example_policy();
     CreateExecutionResult created;
     PEF_TRY(runtime.create_execution(caller, create, created));
@@ -25,7 +25,7 @@ Status prepare_interrupted(Runtime& runtime, const CallerContext& caller,
     PEF_TRY(ensure_running(runtime, caller, bound));
 
     BeginActionRequest begin;
-    begin.request = RequestId{500};
+    begin.request = next_request();
     begin.token = bound.token;
     begin.effect_class = cls;
     begin.evidence.kind = EvidenceKind::Synthetic;
@@ -40,8 +40,8 @@ Status prepare_interrupted(Runtime& runtime, const CallerContext& caller,
 
     // No durable receipt is recorded: the physical outcome is unknown.
     RecoveryOutcome recovered;
-    PEF_TRY(runtime.fence(caller, RequestId{501}, execution, "simulated process death"));
-    return runtime.recover(caller, RequestId{502}, execution, recovered);
+    PEF_TRY(runtime.fence(caller, next_request(), execution, "simulated process death"));
+    return runtime.recover(caller, next_request(), execution, recovered);
 }
 
 }  // namespace

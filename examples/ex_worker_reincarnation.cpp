@@ -19,7 +19,7 @@ int main() {
     }
     CallerContext caller{SessionId{}, opened.epoch};
     CreateExecutionRequest create;
-    create.request = RequestId{1};
+    create.request = next_request();
     create.policy = example_policy();
     CreateExecutionResult created;
     if (const Status status = runtime.create_execution(caller, create, created); !status.ok()) {
@@ -65,7 +65,7 @@ int main() {
 
     // The old boot may not start new work.
     BeginActionRequest stale;
-    stale.request = RequestId{50};
+    stale.request = next_request();
     stale.token = first.token;
     stale.effect_class = SideEffectClass::Pure;
     BeginActionResult stale_action;

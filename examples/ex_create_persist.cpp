@@ -22,7 +22,7 @@ int main() {
 
     CallerContext caller{SessionId{}, opened.epoch};
     CreateExecutionRequest create;
-    create.request = RequestId{1};
+    create.request = next_request();
     create.policy = example_policy();
     CreateExecutionResult created;
     if (const Status status = runtime.create_execution(caller, create, created); !status.ok()) {

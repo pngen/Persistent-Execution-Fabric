@@ -19,7 +19,7 @@ int main() {
     }
     CallerContext caller{SessionId{}, opened.epoch};
     CreateExecutionRequest create;
-    create.request = RequestId{1};
+    create.request = next_request();
     create.policy = example_policy();
     CreateExecutionResult created;
     if (const Status status = runtime.create_execution(caller, create, created); !status.ok()) {
@@ -36,7 +36,7 @@ int main() {
     }
 
     BeginActionRequest begin;
-    begin.request = RequestId{10};
+    begin.request = next_request();
     begin.token = bound.token;
     begin.effect_class = SideEffectClass::NonRepeatable;
     begin.evidence.kind = EvidenceKind::Real;
@@ -48,13 +48,13 @@ int main() {
     say("dispatched NON_REPEATABLE action ordinal " + std::to_string(action.ordinal));
 
     // The worker dies with no durable acknowledgement.
-    if (const Status status = runtime.fence(caller, RequestId{11}, created.execution,
+    if (const Status status = runtime.fence(caller, next_request(), created.execution,
                                             "simulated process death");
         !status.ok()) {
         return fail(status);
     }
     RecoveryOutcome recovered;
-    if (const Status status = runtime.recover(caller, RequestId{12}, created.execution, recovered);
+    if (const Status status = runtime.recover(caller, next_request(), created.execution, recovered);
         !status.ok()) {
         return fail(status);
     }
@@ -70,7 +70,7 @@ int main() {
 
     // Attempting to complete the ambiguous action must be refused.
     CompleteActionRequest complete;
-    complete.request = RequestId{13};
+    complete.request = next_request();
     complete.token = bound.token;
     complete.action = action.action;
     complete.action_generation = action.action_generation;
@@ -79,7 +79,7 @@ int main() {
 
     // An operator establishes, from an external system, that no effect applied.
     ResolveAmbiguityRequest resolve;
-    resolve.request = RequestId{14};
+    resolve.request = next_request();
     resolve.caller = caller;
     resolve.execution = created.execution;
     resolve.ambiguity = view.execution.ambiguity;
@@ -106,7 +106,7 @@ int main() {
         return fail(status);
     }
     BeginActionRequest replay_begin = begin;
-    replay_begin.request = RequestId{15};
+    replay_begin.request = next_request();
     replay_begin.token = replacement.token;
     replay_begin.request_key = "example-replay-key";
     BeginActionResult replayed;
@@ -117,7 +117,7 @@ int main() {
         " generation " + std::to_string(replayed.action_generation.value()));
 
     CompleteActionRequest replay_complete;
-    replay_complete.request = RequestId{16};
+    replay_complete.request = next_request();
     replay_complete.token = replacement.token;
     replay_complete.action = replayed.action;
     replay_complete.action_generation = replayed.action_generation;
