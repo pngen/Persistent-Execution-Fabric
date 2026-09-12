@@ -162,6 +162,19 @@ struct Runtime::Impl {
     }
 
     // ---- persistence ------------------------------------------------------
+    // Every append records the journal sequence it landed at, so the aggregate
+    // knows the exact durable point it reflects and a snapshot can state which
+    // journal records it already contains.
+    template <class Rec>
+    Status append(RecordKind kind, const Rec& record, bool flush) {
+        ByteWriter writer(512);
+        encode_record(writer, record);
+        std::uint64_t sequence = 0;
+        PEF_TRY(store.append(kind, writer.bytes(), flush, sequence));
+        state.sequence = sequence;
+        return ok_status();
+    }
+
     Status put_store_meta(bool flush) {
         StoreMetaRecord meta;
         meta.store = state.store;
@@ -169,31 +182,31 @@ struct Runtime::Impl {
         meta.next_execution_sequence = state.next_execution_sequence;
         meta.sequence = state.sequence;
         meta.schema = kPersistenceSchemaVersion;
-        return append_record(store, RecordKind::StoreMeta, meta, flush);
+        return append(RecordKind::StoreMeta, meta, flush);
     }
     Status put_policy(const ExecutionPolicy& r, bool flush) {
-        PEF_TRY(append_record(store, RecordKind::Policy, r, flush));
+        PEF_TRY(append(RecordKind::Policy, r, flush));
         state.policies.upsert(r);
         return ok_status();
     }
     Status put_execution(const ExecutionRecord& r, bool flush) {
-        PEF_TRY(append_record(store, RecordKind::Execution, r, flush));
+        PEF_TRY(append(RecordKind::Execution, r, flush));
         state.executions.upsert(r);
         return ok_status();
     }
     Status put_action(const ActionRecord& r, bool flush) {
-        PEF_TRY(append_record(store, RecordKind::Action, r, flush));
+        PEF_TRY(append(RecordKind::Action, r, flush));
         state.actions.upsert(r);
         index_action(r);
         return ok_status();
     }
     Status put_progress(const ProgressRecord& r, bool flush) {
-        PEF_TRY(append_record(store, RecordKind::Progress, r, flush));
+        PEF_TRY(append(RecordKind::Progress, r, flush));
         state.progress.upsert(r);
         return ok_status();
     }
     Status put_checkpoint(const CheckpointRecord& r, bool flush) {
-        PEF_TRY(append_record(store, RecordKind::Checkpoint, r, flush));
+        PEF_TRY(append(RecordKind::Checkpoint, r, flush));
         const bool is_new = !state.checkpoints.contains(r.id);
         state.checkpoints.upsert(r);
         if (is_new) {
@@ -202,17 +215,17 @@ struct Runtime::Impl {
         return ok_status();
     }
     Status put_continuation(const ContinuationRecord& r, bool flush) {
-        PEF_TRY(append_record(store, RecordKind::Continuation, r, flush));
+        PEF_TRY(append(RecordKind::Continuation, r, flush));
         state.continuations.upsert(r);
         return ok_status();
     }
     Status put_lease(const LeaseRecord& r, bool flush) {
-        PEF_TRY(append_record(store, RecordKind::Lease, r, flush));
+        PEF_TRY(append(RecordKind::Lease, r, flush));
         state.leases.upsert(r);
         return ok_status();
     }
     Status put_replay(const ReplayRecord& r, bool flush) {
-        PEF_TRY(append_record(store, RecordKind::Replay, r, flush));
+        PEF_TRY(append(RecordKind::Replay, r, flush));
         const bool is_new = !state.replays.contains(r.id);
         state.replays.upsert(r);
         if (is_new) {
@@ -221,12 +234,12 @@ struct Runtime::Impl {
         return ok_status();
     }
     Status put_ambiguity(const AmbiguityRecord& r, bool flush) {
-        PEF_TRY(append_record(store, RecordKind::Ambiguity, r, flush));
+        PEF_TRY(append(RecordKind::Ambiguity, r, flush));
         state.ambiguities.upsert(r);
         return ok_status();
     }
     Status put_commit(const CommitRecord& r, bool flush) {
-        PEF_TRY(append_record(store, RecordKind::Commit, r, flush));
+        PEF_TRY(append(RecordKind::Commit, r, flush));
         const bool is_new = !state.commits.contains(r.id);
         state.commits.upsert(r);
         if (is_new) {
@@ -235,7 +248,7 @@ struct Runtime::Impl {
         return ok_status();
     }
     Status put_recovery(const RecoveryRecord& r, bool flush) {
-        PEF_TRY(append_record(store, RecordKind::Recovery, r, flush));
+        PEF_TRY(append(RecordKind::Recovery, r, flush));
         state.recoveries.upsert(r);
         return ok_status();
     }
@@ -423,7 +436,7 @@ struct Runtime::Impl {
         out.group.action = sealed;
         out.group.execution = next;
 
-        PEF_TRY(append_record(store, RecordKind::CommitGroup, out.group, flush));
+        PEF_TRY(append(RecordKind::CommitGroup, out.group, flush));
         const bool new_commit = !state.commits.contains(commit.id);
         state.commits.upsert(commit);
         if (new_commit) {
@@ -565,7 +578,7 @@ Status Runtime::open(const RuntimeConfig& config, OpenOutcome& outcome) {
         if (reconcile_state(impl_->state, repairs)) {
             impl_->rebuild_indexes();
             for (const auto& repair : repairs) {
-                PEF_TRY(append_record(impl_->store, RecordKind::CommitGroup, repair, true));
+                PEF_TRY(impl_->append(RecordKind::CommitGroup, repair, true));
             }
             outcome.reconciled_commits = repairs.size();
             outcome.detail += "reconciled " + std::to_string(repairs.size()) +
