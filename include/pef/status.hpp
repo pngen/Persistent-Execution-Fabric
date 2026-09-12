@@ -48,6 +48,13 @@ enum class Code : unsigned {
 
 [[nodiscard]] std::string_view code_name(Code code) noexcept;
 
+// Highest valid ordinal plus one. Used by the defensive decoder to reject a
+// refusal code it does not understand instead of coercing it.
+inline constexpr unsigned kCodeCount = 32;
+[[nodiscard]] constexpr bool pef_valid_enum(Code code) noexcept {
+    return static_cast<unsigned>(code) < kCodeCount;
+}
+
 class Status {
 public:
     Status() noexcept = default;

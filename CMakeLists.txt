@@ -77,6 +77,11 @@ set(PEF_CORE_SOURCES
     src/recovery.cpp
     src/audit.cpp
     src/runtime.cpp
+    src/protocol.cpp
+    src/net.cpp
+    src/server.cpp
+    src/client.cpp
+    src/explain.cpp
 )
 
 add_library(pef ${PEF_CORE_SOURCES})
@@ -157,4 +162,21 @@ if(PEF_BUILD_TESTS)
 
     pef_add_test(pef_tests_core tests/test_core.cpp)
     pef_add_test(pef_tests_runtime tests/test_runtime.cpp)
+endif()
+
+# ---------------------------------------------------------------------------
+# Control-plane executables
+# ---------------------------------------------------------------------------
+if(PEF_BUILD_TOOLS)
+    function(pef_add_tool target_name source)
+        add_executable(${target_name} ${source})
+        target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+        target_link_libraries(${target_name} PRIVATE pef)
+        pef_apply_warnings(${target_name})
+        install(TARGETS ${target_name} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endfunction()
+
+    pef_add_tool(pef_coordinator apps/pef_coordinator/main.cpp)
+    pef_add_tool(pef_worker apps/pef_worker/main.cpp)
+    pef_add_tool(pef_cli apps/pef_cli/main.cpp)
 endif()

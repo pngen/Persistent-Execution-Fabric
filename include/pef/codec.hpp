@@ -43,6 +43,20 @@ struct is_vector<std::vector<T, A>> : std::true_type {};
 template <class T>
 struct RecordTraits;
 
+template <class T>
+void encode_record(ByteWriter& w, const T& record);
+
+template <class T>
+bool decode_record(ByteReader& r, T& out);
+
+// True when a type describes its durable field order with RecordTraits. Types
+// that do not must provide their own encode()/decode() members.
+template <class T, class = void>
+struct has_record_traits : std::false_type {};
+template <class T>
+struct has_record_traits<T, std::void_t<decltype(RecordTraits<T>::members)>>
+    : std::true_type {};
+
 // Declared by each enum in its own header as an ADL customization point.
 // The primary template never matches; a missing overload is a compile error,
 // which is intentional: every persisted enum must state its valid range.
@@ -96,6 +110,8 @@ void write_field(ByteWriter& w, const T& value) {
         for (const auto& element : value) {
             write_field(w, element);
         }
+    } else if constexpr (has_record_traits<U>::value) {
+        encode_record(w, value);
     } else {
         value.encode(w);
     }
@@ -177,6 +193,8 @@ bool read_field(ByteReader& r, T& out) {
                 }
             }
         }
+    } else if constexpr (has_record_traits<U>::value) {
+        ok = decode_record(r, out);
     } else {
         ok = U::decode(r, out);
     }

@@ -207,6 +207,26 @@ RecoveryPlan classify_recovery(const RecoveryInput& input) {
             return plan;
         }
 
+        // An explicit resolution that the effect did not apply is a durable
+        // statement, so re-driving the same logical action is a re-execution of
+        // work that never happened.
+        if (input.ambiguity != nullptr &&
+            input.ambiguity->state == AmbiguityState::ResolvedNotApplied &&
+            input.ambiguity->action == action.id &&
+            input.ambiguity->action_generation == action.generation) {
+            if (policy != nullptr && policy->replay_allowance == ReplayAllowance::ForbidReplay) {
+                plan.decision = RecoveryDecision::Unsupported;
+                plan.explanation =
+                    "the effect was resolved as not applied but policy forbids replay";
+                return plan;
+            }
+            plan.decision = RecoveryDecision::ReplaySafeAction;
+            plan.explanation =
+                "an explicit resolution established that the effect did not apply; the same "
+                "logical action may be re-driven under a new generation";
+            return plan;
+        }
+
         // No usable receipt. The side-effect class decides whether automatic
         // repetition is permitted at all.
         if (policy != nullptr && policy->replay_allowance == ReplayAllowance::ForbidReplay) {
