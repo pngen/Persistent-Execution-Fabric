@@ -101,12 +101,32 @@ struct Runtime::Impl {
     std::deque<RequestId> request_order;
     // Derived index: execution -> action keys in ascending ordinal order. It is
     // a pure function of durable state and is rebuilt on open.
+    // Derived indexes: execution identity to the records that belong to it.
+    // They are pure functions of durable state, rebuilt once on open, and
+    // maintained in O(1) amortized on every write. Without them, a query or a
+    // lookup would degrade to a scan of the whole store.
     std::unordered_map<ExecutionId, std::vector<ActionKey>, IdHasher<ExecutionIdTag>> action_index;
+    std::unordered_map<ExecutionId, std::vector<CheckpointId>, IdHasher<ExecutionIdTag>>
+        checkpoint_index;
+    std::unordered_map<ExecutionId, std::vector<CommitId>, IdHasher<ExecutionIdTag>> commit_index;
+    std::unordered_map<ExecutionId, std::vector<ReplayId>, IdHasher<ExecutionIdTag>> replay_index;
 
-    void rebuild_action_index() {
+    void rebuild_indexes() {
         action_index.clear();
+        checkpoint_index.clear();
+        commit_index.clear();
+        replay_index.clear();
         for (const auto& action : state.actions.insertion_order()) {
             action_index[action.execution].push_back(ActionKey{action.id, action.generation});
+        }
+        for (const auto& checkpoint : state.checkpoints.insertion_order()) {
+            checkpoint_index[checkpoint.execution].push_back(checkpoint.id);
+        }
+        for (const auto& commit : state.commits.insertion_order()) {
+            commit_index[commit.execution].push_back(commit.id);
+        }
+        for (const auto& replay : state.replays.insertion_order()) {
+            replay_index[replay.execution].push_back(replay.id);
         }
         for (auto& entry : action_index) {
             std::sort(entry.second.begin(), entry.second.end(),
@@ -114,15 +134,23 @@ struct Runtime::Impl {
         }
     }
 
+    // Action keys arrive in ascending ordinal order in the common case, so the
+    // index is appended to rather than re-sorted on every insert.
     void index_action(const ActionRecord& action) {
         auto& keys = action_index[action.execution];
         const ActionKey key{action.id, action.generation};
-        if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
-            keys.push_back(key);
-            std::sort(keys.begin(), keys.end(), [](const ActionKey& a, const ActionKey& b) {
-                return a < b;
-            });
+        if (!keys.empty() && !(keys.back() < key)) {
+            const auto position = std::lower_bound(keys.begin(), keys.end(), key);
+            if (position != keys.end() && *position == key) {
+                return;
+            }
+            keys.insert(position, key);
+            return;
         }
+        if (!keys.empty() && keys.back() == key) {
+            return;
+        }
+        keys.push_back(key);
     }
 
     [[nodiscard]] const ActionRecord* latest_action(ExecutionId execution) const {
@@ -166,7 +194,11 @@ struct Runtime::Impl {
     }
     Status put_checkpoint(const CheckpointRecord& r, bool flush) {
         PEF_TRY(append_record(store, RecordKind::Checkpoint, r, flush));
+        const bool is_new = !state.checkpoints.contains(r.id);
         state.checkpoints.upsert(r);
+        if (is_new) {
+            checkpoint_index[r.execution].push_back(r.id);
+        }
         return ok_status();
     }
     Status put_continuation(const ContinuationRecord& r, bool flush) {
@@ -181,7 +213,11 @@ struct Runtime::Impl {
     }
     Status put_replay(const ReplayRecord& r, bool flush) {
         PEF_TRY(append_record(store, RecordKind::Replay, r, flush));
+        const bool is_new = !state.replays.contains(r.id);
         state.replays.upsert(r);
+        if (is_new) {
+            replay_index[r.execution].push_back(r.id);
+        }
         return ok_status();
     }
     Status put_ambiguity(const AmbiguityRecord& r, bool flush) {
@@ -191,7 +227,11 @@ struct Runtime::Impl {
     }
     Status put_commit(const CommitRecord& r, bool flush) {
         PEF_TRY(append_record(store, RecordKind::Commit, r, flush));
+        const bool is_new = !state.commits.contains(r.id);
         state.commits.upsert(r);
+        if (is_new) {
+            commit_index[r.execution].push_back(r.id);
+        }
         return ok_status();
     }
     Status put_recovery(const RecoveryRecord& r, bool flush) {
@@ -240,10 +280,22 @@ struct Runtime::Impl {
         return ok_status();
     }
 
-    Status check_caller(const CallerContext& caller) const {
+    // No operation may begin after the store has been closed. Because every
+    // public operation holds the runtime lock, an operation that has already
+    // acquired it runs to completion before close() can be reached, and one
+    // that arrives afterwards is refused before it mutates anything.
+    Status check_open() const {
+        if (!open) {
+            return err(Code::ShuttingDown, "coordinator is not open");
+        }
         if (shutting_down) {
             return err(Code::ShuttingDown, "coordinator is shutting down");
         }
+        return ok_status();
+    }
+
+    Status check_caller(const CallerContext& caller) const {
+        PEF_TRY(check_open());
         return check_epoch(caller.epoch);
     }
 
@@ -314,51 +366,73 @@ struct Runtime::Impl {
     // The execution record is always persisted last by the caller so that it
     // never references a record that is not durable.
     struct StagedCommit {
-        CommitRecord commit;
-        ProgressRecord progress;
-        ActionRecord action;
+        CommitGroupRecord group;
         ProgressGeneration progress_generation;
     };
 
+    // Computes one logical commit and writes it as a single journal record, so
+    // that a crash can never leave a commit without its progress or progress
+    // without the aggregate that promotes it.
     Status stage_commit(const ExecutionRecord& execution, const ActionRecord& action,
                         RequestId request, const Evidence& evidence, bool flush,
                         StagedCommit& out) {
         out.progress_generation = execution.progress_generation.next();
-        out.progress.id = derive_progress_id(execution.id, out.progress_generation);
-        out.progress.generation = out.progress_generation;
-        out.progress.execution = execution.id;
-        out.progress.execution_generation = execution.generation;
-        out.progress.action = action.id;
-        out.progress.action_generation = action.generation;
-        out.progress.epoch = state.epoch;
-        out.progress.ordinal = action.sequence;
-        out.progress.committed = true;
-        out.progress.durable_sequence = state.sequence;
+        ProgressRecord progress;
+        progress.id = derive_progress_id(execution.id, out.progress_generation);
+        progress.generation = out.progress_generation;
+        progress.execution = execution.id;
+        progress.execution_generation = execution.generation;
+        progress.action = action.id;
+        progress.action_generation = action.generation;
+        progress.epoch = state.epoch;
+        progress.ordinal = action.sequence;
+        progress.committed = true;
+        progress.durable_sequence = state.sequence;
 
-        out.commit.id = derive_commit_id(execution.id, action.id, action.generation,
-                                         out.progress_generation);
-        out.commit.execution = execution.id;
-        out.commit.execution_generation = execution.generation;
-        out.commit.action = action.id;
-        out.commit.action_generation = action.generation;
-        out.commit.progress = out.progress.id;
-        out.commit.progress_generation = out.progress_generation;
-        out.commit.epoch = state.epoch;
-        out.commit.request = request;
-        if (state.commits.find(out.commit.id) != nullptr) {
+        CommitRecord commit;
+        commit.id = derive_commit_id(execution.id, action.id, action.generation,
+                                     out.progress_generation);
+        commit.execution = execution.id;
+        commit.execution_generation = execution.generation;
+        commit.action = action.id;
+        commit.action_generation = action.generation;
+        commit.progress = progress.id;
+        commit.progress_generation = out.progress_generation;
+        commit.epoch = state.epoch;
+        commit.request = request;
+        if (state.commits.find(commit.id) != nullptr) {
             return err(Code::DuplicateCommit,
                        "a durable commit already exists for this action identity and generation");
         }
-        out.progress.commit = out.commit.id;
+        progress.commit = commit.id;
 
-        out.action = action;
-        out.action.status = ActionStatus::Committed;
-        out.action.commit = out.commit.id;
-        out.action.receipt = evidence;
+        ActionRecord sealed = action;
+        sealed.status = ActionStatus::Committed;
+        sealed.commit = commit.id;
+        sealed.receipt = evidence;
 
-        PEF_TRY(put_commit(out.commit, flush));
-        PEF_TRY(put_progress(out.progress, flush));
-        PEF_TRY(put_action(out.action, flush));
+        ExecutionRecord next = execution;
+        next.progress_generation = out.progress_generation;
+        next.progress = progress.id;
+        next.last_commit = commit.id;
+        next.committed_actions = execution.committed_actions + 1;
+        next.epoch = state.epoch;
+
+        out.group.commit = commit;
+        out.group.progress = progress;
+        out.group.action = sealed;
+        out.group.execution = next;
+
+        PEF_TRY(append_record(store, RecordKind::CommitGroup, out.group, flush));
+        const bool new_commit = !state.commits.contains(commit.id);
+        state.commits.upsert(commit);
+        if (new_commit) {
+            commit_index[commit.execution].push_back(commit.id);
+        }
+        state.progress.upsert(progress);
+        state.actions.upsert(sealed);
+        index_action(sealed);
+        state.executions.upsert(next);
         return ok_status();
     }
 
@@ -460,6 +534,9 @@ Status Runtime::open(const RuntimeConfig& config, OpenOutcome& outcome) {
     }
     impl_->config = config;
     config_ = config;
+    // A runtime that was shut down may be opened again, exactly as a fresh
+    // coordinator process would open the same store.
+    impl_->shutting_down = false;
 
     PEF_TRY(impl_->store.open(config.store_path, config.create_if_missing, config.store_limits));
 
@@ -478,7 +555,23 @@ Status Runtime::open(const RuntimeConfig& config, OpenOutcome& outcome) {
         return err(Code::Unsupported, "durable state schema is not supported by this build");
     }
     impl_->state.schema = kPersistenceSchemaVersion;
-    impl_->rebuild_action_index();
+    impl_->rebuild_indexes();
+
+    // A torn journal tail can leave durable detail records that the aggregate
+    // record never promoted. The detail records are the durable facts, so the
+    // aggregate is brought forward and the repair is itself journaled.
+    {
+        std::vector<CommitGroupRecord> repairs;
+        if (reconcile_state(impl_->state, repairs)) {
+            impl_->rebuild_indexes();
+            for (const auto& repair : repairs) {
+                PEF_TRY(append_record(impl_->store, RecordKind::CommitGroup, repair, true));
+            }
+            outcome.reconciled_commits = repairs.size();
+            outcome.detail += "reconciled " + std::to_string(repairs.size()) +
+                              " commit(s) whose aggregate update was lost; ";
+        }
+    }
 
     // Coordinator restart advances the epoch. Persisted execution identities
     // survive; process-local sessions and every lease from the previous epoch do
@@ -921,6 +1014,7 @@ Status Runtime::bind_worker(const CallerContext& caller, const BindWorkerRequest
 
 Status Runtime::start(const StartRequest& request) {
     std::lock_guard<std::mutex> guard(impl_->mu);
+    PEF_TRY(impl_->check_open());
     const ExecutionRecord* execution = nullptr;
     const LeaseRecord* lease = nullptr;
     PEF_TRY(impl_->validate_token(request.token, execution, lease));
@@ -959,6 +1053,7 @@ Status Runtime::start(const StartRequest& request) {
 // ---------------------------------------------------------------------------
 Status Runtime::begin_action(const BeginActionRequest& request, BeginActionResult& out) {
     std::lock_guard<std::mutex> guard(impl_->mu);
+    PEF_TRY(impl_->check_open());
     const ExecutionRecord* execution = nullptr;
     const LeaseRecord* lease = nullptr;
     PEF_TRY(impl_->validate_token(request.token, execution, lease));
@@ -1093,6 +1188,7 @@ Status Runtime::begin_action(const BeginActionRequest& request, BeginActionResul
 
 Status Runtime::complete_action(const CompleteActionRequest& request, CompleteActionResult& out) {
     std::lock_guard<std::mutex> guard(impl_->mu);
+    PEF_TRY(impl_->check_open());
     const ExecutionRecord* execution = nullptr;
     const LeaseRecord* lease = nullptr;
 
@@ -1175,31 +1271,25 @@ Status Runtime::complete_action(const CompleteActionRequest& request, CompleteAc
     Impl::StagedCommit staged;
     PEF_TRY(impl_->stage_commit(*execution, *existing_action, request.request,
                                 request.completion.evidence, flush, staged));
-
-    ExecutionRecord next = *execution;
-    next.progress_generation = staged.progress_generation;
-    next.progress = staged.progress.id;
-    next.last_commit = staged.commit.id;
-    next.committed_actions = execution->committed_actions + 1;
-    next.epoch = impl_->state.epoch;
-
-    PEF_TRY(impl_->put_execution(next, flush));
+    const std::uint64_t committed_actions = staged.group.execution.committed_actions;
 
     impl_->remember_request(
         request.request,
-        CachedOutcome{Code::Ok, staged.commit.id.value(), staged.progress_generation.value()});
-    out.commit = staged.commit.id;
-    out.progress = staged.progress.id;
+        CachedOutcome{Code::Ok, staged.group.commit.id.value(),
+                      staged.progress_generation.value()});
+    out.commit = staged.group.commit.id;
+    out.progress = staged.group.progress.id;
     out.progress_generation = staged.progress_generation;
-    out.ordinal = staged.action.sequence;
+    out.ordinal = staged.group.action.sequence;
     out.duplicate = false;
     out.checkpoint_due = policy != nullptr && policy->checkpoint_interval_actions > 0 &&
-                         (next.committed_actions % policy->checkpoint_interval_actions) == 0;
+                         (committed_actions % policy->checkpoint_interval_actions) == 0;
     return ok_status();
 }
 
 Status Runtime::fail_action(const FailActionRequest& request) {
     std::lock_guard<std::mutex> guard(impl_->mu);
+    PEF_TRY(impl_->check_open());
     const ExecutionRecord* execution = nullptr;
     const LeaseRecord* lease = nullptr;
     PEF_TRY(impl_->validate_token(request.token, execution, lease));
@@ -1231,6 +1321,7 @@ Status Runtime::fail_action(const FailActionRequest& request) {
 
 Status Runtime::report_side_effect(const ReportSideEffectRequest& request) {
     std::lock_guard<std::mutex> guard(impl_->mu);
+    PEF_TRY(impl_->check_open());
     const ExecutionRecord* execution = nullptr;
     const LeaseRecord* lease = nullptr;
     PEF_TRY(impl_->validate_token(request.token, execution, lease));
@@ -1265,6 +1356,7 @@ Status Runtime::report_side_effect(const ReportSideEffectRequest& request) {
 Status Runtime::register_checkpoint(const RegisterCheckpointRequest& request,
                                     RegisterCheckpointResult& out) {
     std::lock_guard<std::mutex> guard(impl_->mu);
+    PEF_TRY(impl_->check_open());
     const ExecutionRecord* execution = nullptr;
     const LeaseRecord* lease = nullptr;
     PEF_TRY(impl_->validate_token(request.token, execution, lease));
@@ -1398,6 +1490,7 @@ namespace {
 
 Status Runtime::resume(const ResumeRequest& request, ResumeResult& out) {
     std::lock_guard<std::mutex> guard(impl_->mu);
+    PEF_TRY(impl_->check_open());
     const ExecutionRecord* execution = nullptr;
     const LeaseRecord* lease = nullptr;
     PEF_TRY(impl_->validate_token(request.token, execution, lease));
@@ -1815,12 +1908,10 @@ Status Runtime::recover_locked(const CallerContext& caller, RequestId request,
         Impl::StagedCommit staged;
         PEF_TRY(impl_->stage_commit(*execution, *in_flight, request, in_flight->receipt, flush,
                                     staged));
-        next.progress_generation = staged.progress_generation;
-        next.progress = staged.progress.id;
-        next.last_commit = staged.commit.id;
-        next.committed_actions = execution->committed_actions + 1;
+        // stage_commit installed the promoted aggregate; continue from it.
+        next = *impl_->state.executions.find(execution_id);
         committed = true;
-        commit = staged.commit.id;
+        commit = staged.group.commit.id;
     }
 
     if (plan.decision == RecoveryDecision::ResumeFromCheckpoint && plan.checkpoint.valid()) {
@@ -1927,12 +2018,9 @@ Status Runtime::resolve_ambiguity(const ResolveAmbiguityRequest& request,
         Impl::StagedCommit staged;
         PEF_TRY(impl_->stage_commit(*execution, *action, request.request, request.evidence, flush,
                                     staged));
-        next.progress_generation = staged.progress_generation;
-        next.progress = staged.progress.id;
-        next.last_commit = staged.commit.id;
-        next.committed_actions = execution->committed_actions + 1;
+        next = *impl_->state.executions.find(request.execution);
         committed = true;
-        commit = staged.commit.id;
+        commit = staged.group.commit.id;
         progress_generation = staged.progress_generation;
         next.blocked = false;
         next.blocked_above_ordinal = 0;
@@ -2215,33 +2303,34 @@ Status Runtime::query(ExecutionId execution_id, ExecutionView& out) const {
             }
         }
     }
-    for (const CheckpointRecord* checkpoint : impl_->state.checkpoints.canonical_order()) {
-        if (checkpoint->execution != execution_id) {
-            continue;
+    if (const auto it = impl_->checkpoint_index.find(execution_id);
+        it != impl_->checkpoint_index.end()) {
+        for (CheckpointId id : it->second) {
+            if (out.checkpoints.size() >= impl_->config.max_view_actions) {
+                break;
+            }
+            if (const CheckpointRecord* checkpoint = impl_->state.checkpoints.find(id);
+                checkpoint != nullptr) {
+                out.checkpoints.push_back(*checkpoint);
+            }
         }
-        if (out.checkpoints.size() >= impl_->config.max_view_actions) {
-            break;
-        }
-        out.checkpoints.push_back(*checkpoint);
+        std::stable_sort(out.checkpoints.begin(), out.checkpoints.end(),
+                         [](const CheckpointRecord& a, const CheckpointRecord& b) {
+                             return a.generation > b.generation;
+                         });
     }
-    std::stable_sort(out.checkpoints.begin(), out.checkpoints.end(),
-                     [](const CheckpointRecord& a, const CheckpointRecord& b) {
-                         return a.generation > b.generation;
-                     });
-    for (const ReplayRecord* replay : impl_->state.replays.canonical_order()) {
-        if (replay->execution != execution_id) {
-            continue;
+    if (const auto it = impl_->replay_index.find(execution_id); it != impl_->replay_index.end()) {
+        for (ReplayId id : it->second) {
+            if (out.replays.size() >= impl_->config.max_view_actions) {
+                break;
+            }
+            if (const ReplayRecord* replay = impl_->state.replays.find(id); replay != nullptr) {
+                out.replays.push_back(*replay);
+            }
         }
-        if (out.replays.size() >= impl_->config.max_view_actions) {
-            break;
-        }
-        out.replays.push_back(*replay);
     }
-    out.commit_count = 0;
-    for (const CommitRecord* commit : impl_->state.commits.canonical_order()) {
-        if (commit->execution == execution_id) {
-            ++out.commit_count;
-        }
+    if (const auto it = impl_->commit_index.find(execution_id); it != impl_->commit_index.end()) {
+        out.commit_count = it->second.size();
     }
     return ok_status();
 }

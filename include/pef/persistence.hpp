@@ -43,12 +43,16 @@ enum class RecordKind : std::uint16_t {
     // An explicit durability barrier. Carries no state; its presence proves the
     // writer reached a known point.
     Barrier = 13,
+    // A logical commit and everything it implies, written as ONE record. A torn
+    // tail can therefore never leave a commit without its progress, or progress
+    // without the aggregate that promotes it.
+    CommitGroup = 14,
 };
 
 [[nodiscard]] std::string_view record_kind_name(RecordKind kind) noexcept;
 [[nodiscard]] std::optional<RecordKind> parse_record_kind(std::string_view text) noexcept;
 
-inline constexpr std::uint16_t kMaxRecordKind = 13;
+inline constexpr std::uint16_t kMaxRecordKind = 14;
 [[nodiscard]] constexpr bool pef_valid_enum(RecordKind v) noexcept {
     return static_cast<std::uint16_t>(v) >= 1 && static_cast<std::uint16_t>(v) <= kMaxRecordKind;
 }
@@ -213,6 +217,22 @@ struct RecordTraits<BarrierRecord> {
         std::make_tuple(&BarrierRecord::sequence, &BarrierRecord::reason);
 };
 
+// One logical commit: the commit identity, the progress record it promotes,
+// the sealed action, and the execution aggregate that references all of it.
+struct CommitGroupRecord {
+    CommitRecord commit;
+    ProgressRecord progress;
+    ActionRecord action;
+    ExecutionRecord execution;
+};
+
+template <>
+struct RecordTraits<CommitGroupRecord> {
+    static constexpr auto members = std::make_tuple(
+        &CommitGroupRecord::commit, &CommitGroupRecord::progress, &CommitGroupRecord::action,
+        &CommitGroupRecord::execution);
+};
+
 struct JournalRecord {
     RecordKind kind = RecordKind::Barrier;
     std::uint64_t sequence = 0;
@@ -292,6 +312,13 @@ struct DurableState {
 // existing identity replaces the stored one. Returns false when the payload
 // does not decode, which is a corruption signal.
 [[nodiscard]] bool apply_record(DurableState& state, RecordKind kind, const Bytes& payload);
+
+// Folds durable detail records back into the aggregates that reference them.
+// A journal whose tail was torn can leave a durable commit or checkpoint that
+// the aggregate record never promoted; the detail records are the durable
+// facts, so the aggregate is brought forward to match. Returns true when
+// anything changed.
+[[nodiscard]] bool reconcile_state(DurableState& state, std::vector<CommitGroupRecord>& repairs);
 
 // ---------------------------------------------------------------------------
 // FileDurableStore: one directory, one snapshot, one append-only journal.

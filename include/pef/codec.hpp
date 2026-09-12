@@ -218,11 +218,13 @@ bool decode_record(ByteReader& r, T& out) {
     return ok && r.ok();
 }
 
-// Encode a record into a standalone buffer.
+// Encode a value into a standalone buffer. Works for any type the codec
+// understands: records with RecordTraits, and types with their own
+// encode()/decode() members.
 template <class T>
 [[nodiscard]] Bytes encode_to_bytes(const T& record) {
     ByteWriter w(256);
-    encode_record(w, record);
+    write_field(w, record);
     return w.take();
 }
 
@@ -230,7 +232,7 @@ template <class T>
 template <class T>
 [[nodiscard]] bool decode_from_bytes(const Bytes& data, T& out) {
     ByteReader r(data);
-    if (!decode_record(r, out)) {
+    if (!read_field(r, out)) {
         return false;
     }
     return r.at_end();

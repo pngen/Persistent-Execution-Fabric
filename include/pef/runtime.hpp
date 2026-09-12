@@ -68,6 +68,9 @@ struct OpenOutcome {
     std::vector<ExecutionId> reclassified;
     std::uint64_t leases_revoked = 0;
     std::uint64_t executions_reclassified = 0;
+    // Commits whose detail records were durable but whose aggregate update was
+    // lost to a torn journal tail, and which recovery brought forward.
+    std::uint64_t reconciled_commits = 0;
     std::string detail;
 };
 

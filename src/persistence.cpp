@@ -577,6 +577,7 @@ struct RecordBoundary {
 // ---------------------------------------------------------------------------
 std::string_view record_kind_name(RecordKind kind) noexcept {
     switch (kind) {
+        case RecordKind::CommitGroup: return "COMMIT_GROUP";
         case RecordKind::StoreMeta: return "STORE_META";
         case RecordKind::Policy: return "POLICY";
         case RecordKind::Execution: return "EXECUTION";
@@ -792,8 +793,104 @@ bool apply_record(DurableState& state, RecordKind kind, const Bytes& payload) {
             }
             return true;
         }
+        case RecordKind::CommitGroup: {
+            CommitGroupRecord group;
+            if (!decode_from_bytes(payload, group)) {
+                return false;
+            }
+            state.commits.upsert(group.commit);
+            state.progress.upsert(group.progress);
+            state.actions.upsert(group.action);
+            state.executions.upsert(group.execution);
+            return true;
+        }
     }
     return false;
+}
+
+bool reconcile_state(DurableState& state, std::vector<CommitGroupRecord>& repairs) {
+    bool changed = false;
+    // Iterate over a snapshot of the identities: the loop updates records.
+    std::vector<ExecutionId> identities;
+    for (const ExecutionRecord* execution : state.executions.canonical_order()) {
+        identities.push_back(execution->id);
+    }
+    for (ExecutionId identity : identities) {
+        const ExecutionRecord* execution = state.executions.find(identity);
+        if (execution == nullptr) {
+            continue;
+        }
+        const ProgressRecord* best = nullptr;
+        std::uint64_t committed = 0;
+        for (const auto& progress : state.progress.insertion_order()) {
+            if (progress.execution != execution->id || !progress.committed) {
+                continue;
+            }
+            ++committed;
+            if (best == nullptr || progress.generation > best->generation) {
+                best = &progress;
+            }
+        }
+        // An action record that is durable but whose aggregate update was lost
+        // still happened: the frontier is brought forward to match.
+        std::uint64_t frontier = execution->action_frontier;
+        ActionGeneration action_generation = execution->action_generation;
+        for (const auto& action : state.actions.insertion_order()) {
+            if (action.execution != execution->id) {
+                continue;
+            }
+            if (action.sequence > frontier) {
+                frontier = action.sequence;
+                action_generation = action.generation;
+            } else if (action.sequence == frontier && action.generation > action_generation) {
+                action_generation = action.generation;
+            }
+        }
+        if (frontier != execution->action_frontier) {
+            ExecutionRecord advanced = *execution;
+            advanced.action_frontier = frontier;
+            advanced.action_generation = action_generation;
+            state.executions.upsert(advanced);
+            execution = state.executions.find(identity);
+            changed = true;
+        }
+
+        if (best == nullptr || best->generation <= execution->progress_generation) {
+            continue;
+        }
+        ExecutionRecord next = *execution;
+        next.progress_generation = best->generation;
+        next.progress = best->id;
+        next.last_commit = best->commit;
+        next.committed_actions = committed;
+
+        const CommitRecord* commit = state.commits.find(best->commit);
+        if (commit == nullptr) {
+            // A committed progress record with no commit identity cannot be
+            // promoted; it is left in place and reported by the auditor.
+            continue;
+        }
+        const ActionRecord* action = state.actions.find(ActionKey{commit->action,
+                                                                  commit->action_generation});
+        if (action == nullptr) {
+            continue;
+        }
+        if (action->status != ActionStatus::Committed || action->commit != commit->id) {
+            ActionRecord sealed = *action;
+            sealed.status = ActionStatus::Committed;
+            sealed.commit = commit->id;
+            state.actions.upsert(sealed);
+        }
+        state.executions.upsert(next);
+        CommitGroupRecord repair;
+        repair.commit = *commit;
+        repair.progress = *best;
+        repair.action = *state.actions.find(ActionKey{commit->action, commit->action_generation});
+        repair.execution = next;
+        repairs.push_back(repair);
+        changed = true;
+    }
+    return changed;
 }
 
 // ---------------------------------------------------------------------------

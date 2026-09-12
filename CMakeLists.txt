@@ -143,6 +143,69 @@ install(FILES
 install(FILES LICENSE NOTICE DESTINATION ${CMAKE_INSTALL_DATADIR}/PersistentExecutionFabric)
 
 # ---------------------------------------------------------------------------
+# Examples
+# ---------------------------------------------------------------------------
+if(PEF_BUILD_EXAMPLES)
+    function(pef_add_example target_name source)
+        add_executable(${target_name} ${source})
+        target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)
+        target_link_libraries(${target_name} PRIVATE pef)
+        pef_apply_warnings(${target_name})
+    endfunction()
+
+    pef_add_example(pef_example_create_persist examples/ex_create_persist.cpp)
+    pef_add_example(pef_example_checkpoint_resume examples/ex_checkpoint_resume.cpp)
+    pef_add_example(pef_example_worker_reincarnation examples/ex_worker_reincarnation.cpp)
+    pef_add_example(pef_example_stale_continuation examples/ex_stale_continuation.cpp)
+    pef_add_example(pef_example_replay_safe examples/ex_replay_safe.cpp)
+    pef_add_example(pef_example_ambiguous_nonrepeatable examples/ex_ambiguous_nonrepeatable.cpp)
+    pef_add_example(pef_example_coordinator_restart examples/ex_coordinator_restart.cpp)
+    pef_add_example(pef_example_installed_consumer examples/ex_installed_consumer.cpp)
+
+    if(PEF_BUILD_TESTS)
+        add_test(NAME pef_examples COMMAND ${CMAKE_COMMAND}
+            -DPEF_BIN_DIR=$<TARGET_FILE_DIR:pef_example_create_persist>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunExamples.cmake)
+        set_tests_properties(pef_examples PROPERTIES TIMEOUT 300)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Benchmarks
+# ---------------------------------------------------------------------------
+if(PEF_BUILD_BENCHMARKS)
+    add_executable(pef_benchmarks benchmarks/bench_core.cpp)
+    target_link_libraries(pef_benchmarks PRIVATE pef)
+    pef_apply_warnings(pef_benchmarks)
+endif()
+
+# ---------------------------------------------------------------------------
+# Optional hardware-bound continuation proof
+#
+# The CUDA driver is loaded dynamically at run time, so enabling this needs no
+# CUDA toolkit and no CUDA build support. When no driver or device is present
+# the proof reports UNSUPPORTED and exits successfully without claiming
+# hardware evidence.
+# ---------------------------------------------------------------------------
+if(PEF_ENABLE_CUDA)
+    add_executable(pef_cuda_continuation
+        cuda/pef_cuda_continuation.cpp
+        cuda/cuda_driver.cpp)
+    target_include_directories(pef_cuda_continuation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cuda)
+    target_link_libraries(pef_cuda_continuation PRIVATE pef)
+    if(WIN32)
+        target_link_libraries(pef_cuda_continuation PRIVATE ${CMAKE_DL_LIBS})
+    else()
+        target_link_libraries(pef_cuda_continuation PRIVATE dl)
+    endif()
+    pef_apply_warnings(pef_cuda_continuation)
+    if(PEF_BUILD_TESTS)
+        add_test(NAME pef_cuda_continuation COMMAND pef_cuda_continuation)
+        set_tests_properties(pef_cuda_continuation PROPERTIES TIMEOUT 300)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 if(PEF_BUILD_TESTS)
@@ -180,6 +243,10 @@ if(PEF_BUILD_TESTS)
 
     pef_add_test(pef_tests_core tests/test_core.cpp)
     pef_add_test(pef_tests_runtime tests/test_runtime.cpp)
+    pef_add_test(pef_tests_adversarial tests/test_adversarial.cpp)
+    pef_add_test(pef_tests_concurrency tests/test_concurrency.cpp)
+    pef_add_test(pef_tests_property tests/test_property.cpp)
+    pef_add_test(pef_tests_scale tests/test_scale.cpp)
 
     if(PEF_BUILD_TOOLS)
         pef_add_multiprocess_test(pef_tests_multiprocess tests/test_multiprocess.cpp)
