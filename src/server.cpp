@@ -53,6 +53,12 @@ struct CoordinatorServer::Impl {
     Listener listener;
     std::atomic<bool> running{false};
     std::atomic<bool> stop_requested{false};
+    std::atomic<bool> accept_finished{false};
+    // Every accepted socket, retained so that stop() can close them and unblock
+    // connection threads waiting in a read. Without this, stopping the
+    // coordinator while a client is connected would join a blocked thread.
+    std::mutex sockets_mu;
+    std::vector<std::shared_ptr<Socket>> sockets;
     std::atomic<std::uint64_t> requests{0};
     std::atomic<std::uint64_t> refusals{0};
     std::atomic<std::uint64_t> replayed{0};
@@ -127,6 +133,10 @@ std::uint64_t CoordinatorServer::replayed_requests() const { return impl_->repla
 
 bool CoordinatorServer::running() const noexcept { return impl_->running.load(); }
 
+bool CoordinatorServer::accept_loop_finished() const noexcept {
+    return impl_->accept_finished.load();
+}
+
 Status CoordinatorServer::start(const ServerConfig& config, OpenOutcome& outcome) {
     if (impl_->running.load()) {
         return err(Code::AlreadyExists, "server is already running");
@@ -165,9 +175,14 @@ Status CoordinatorServer::run() {
                 continue;
             }
             impl_->active_connections.fetch_add(1);
+            auto shared_socket = std::make_shared<Socket>(std::move(socket));
+            {
+                std::lock_guard<std::mutex> guard(impl_->sockets_mu);
+                impl_->sockets.push_back(shared_socket);
+            }
             std::lock_guard<std::mutex> guard(impl_->threads_mu);
-            impl_->connection_threads.emplace_back([this, sock = std::move(socket)]() mutable {
-                FrameChannel channel(std::move(sock));
+            impl_->connection_threads.emplace_back([this, shared_socket]() {
+                FrameChannel channel(shared_socket);
                 ConnectionState state;
                 while (!impl_->stop_requested.load()) {
                     Frame request;
@@ -191,22 +206,38 @@ Status CoordinatorServer::run() {
                     (void)runtime_.end_session(state.session);
                 }
                 channel.close();
+                {
+                    std::lock_guard<std::mutex> sockets_guard(impl_->sockets_mu);
+                    impl_->sockets.erase(
+                        std::remove(impl_->sockets.begin(), impl_->sockets.end(), shared_socket),
+                        impl_->sockets.end());
+                }
                 impl_->active_connections.fetch_sub(1);
             });
         }
     });
     impl_->accept_thread.join();
+    impl_->accept_finished.store(true);
     return ok_status();
 }
 
 Status CoordinatorServer::stop() {
-    if (!impl_->running.load() && !impl_->stop_requested.load()) {
+    if (!impl_->running.load() && !impl_->stop_requested.load() && !impl_->accept_finished.load()) {
         return ok_status();
     }
     impl_->stop_requested.store(true);
     impl_->listener.close();
     if (impl_->accept_thread.joinable()) {
         impl_->accept_thread.join();
+    }
+    // Closing an in-flight connection from another thread unblocks a read and
+    // lets the connection thread finish, which is what makes shutdown while a
+    // client is attached a bounded operation rather than a hang.
+    {
+        std::lock_guard<std::mutex> guard(impl_->sockets_mu);
+        for (auto& socket : impl_->sockets) {
+            socket->close();
+        }
     }
     {
         std::lock_guard<std::mutex> guard(impl_->threads_mu);
@@ -217,7 +248,12 @@ Status CoordinatorServer::stop() {
         }
         impl_->connection_threads.clear();
     }
+    {
+        std::lock_guard<std::mutex> guard(impl_->sockets_mu);
+        impl_->sockets.clear();
+    }
     impl_->running.store(false);
+    impl_->accept_finished.store(true);
     return ok_status();
 }
 

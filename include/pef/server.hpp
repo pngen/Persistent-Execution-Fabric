@@ -49,6 +49,9 @@ public:
     [[nodiscard]] std::uint64_t refusals_served() const;
     [[nodiscard]] std::uint64_t replayed_requests() const;
     [[nodiscard]] bool running() const noexcept;
+    // True once the accept loop has returned, whether because stop() was called
+    // or because a SHUTDOWN request arrived.
+    [[nodiscard]] bool accept_loop_finished() const noexcept;
     [[nodiscard]] Runtime& runtime() noexcept { return runtime_; }
     [[nodiscard]] const Runtime& runtime() const noexcept { return runtime_; }
     [[nodiscard]] const OpenOutcome& open_outcome() const noexcept { return outcome_; }

@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(run_ms);
     while (!g_stop.load()) {
-        if (server.running() == false) {
+        if (server.accept_loop_finished()) {
             break;
         }
         if (run_ms != 0 && std::chrono::steady_clock::now() >= deadline) {

@@ -1001,8 +1001,11 @@ Status Runtime::begin_action(const BeginActionRequest& request, BeginActionResul
     bool is_replay = false;
     std::uint64_t ordinal = execution->action_frontier + 1;
     ActionGeneration generation{1};
-    if (latest != nullptr && latest->sequence == execution->action_frontier &&
-        latest->status == ActionStatus::Failed) {
+    const bool retryable_frontier =
+        latest != nullptr &&
+        (latest->status == ActionStatus::Failed ||
+         latest->status == ActionStatus::EffectNotApplied);
+    if (latest != nullptr && latest->sequence == execution->action_frontier && retryable_frontier) {
         is_replay = true;
         ordinal = execution->action_frontier;
         generation = latest->generation.next();

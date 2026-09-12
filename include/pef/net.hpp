@@ -82,15 +82,22 @@ class FrameChannel {
 public:
     FrameChannel() = default;
     explicit FrameChannel(Socket socket);
+    // Constructs a channel over a socket that the caller also retains, so that
+    // the server can close it from another thread to unblock a pending read.
+    explicit FrameChannel(std::shared_ptr<Socket> socket);
 
     [[nodiscard]] Status send(const Frame& frame);
     [[nodiscard]] Status receive(Frame& out, std::string& reason);
     void close() noexcept;
-    [[nodiscard]] bool valid() const noexcept { return socket_.valid(); }
-    void set_read_timeout_ms(int milliseconds) { socket_.set_read_timeout_ms(milliseconds); }
+    [[nodiscard]] bool valid() const noexcept { return socket_ != nullptr && socket_->valid(); }
+    void set_read_timeout_ms(int milliseconds) {
+        if (socket_) {
+            socket_->set_read_timeout_ms(milliseconds);
+        }
+    }
 
 private:
-    Socket socket_;
+    std::shared_ptr<Socket> socket_;
 };
 
 [[nodiscard]] Status connect_to(const std::string& host, std::uint16_t port, Socket& out,

@@ -858,13 +858,18 @@ Status FileDurableStore::open(const std::filesystem::path& directory, bool creat
     }
 
     PEF_TRY(impl_->journal.open_append(journal_path));
-    Bytes header_bytes;
-    bool header_exists = false;
-    PEF_TRY(platform_read_file(journal_path, kJournalHeaderSize, header_bytes, header_exists));
-    if (!header_exists || header_bytes.size() < kJournalHeaderSize) {
+
+    // The journal is read once here: the header establishes the store identity
+    // and the first sequence, and the same bytes establish the true append
+    // position.
+    Bytes journal;
+    bool journal_readable = false;
+    PEF_TRY(platform_read_file(journal_path, limits_.max_journal_load_bytes, journal,
+                               journal_readable));
+    if (!journal_readable || journal.size() < kJournalHeaderSize) {
         return err(Code::TruncatedState, "journal header is truncated: " + journal_path.string());
     }
-    const auto* h = reinterpret_cast<const std::uint8_t*>(header_bytes.data());
+    const auto* h = reinterpret_cast<const std::uint8_t*>(journal.data());
     if (std::memcmp(h, kJournalMagic, 8) != 0) {
         return err(Code::CorruptState, "journal header magic mismatch: " + journal_path.string());
     }
@@ -883,9 +888,6 @@ Status FileDurableStore::open(const std::filesystem::path& directory, bool creat
     // Establish the true append position by scanning the journal for its last
     // readable record. Appending positionally without this would reuse sequence
     // numbers after a crash and silently hide records from replay.
-    Bytes journal;
-    bool read_exists = false;
-    PEF_TRY(platform_read_file(journal_path, limits_.max_journal_load_bytes, journal, read_exists));
     last_sequence_ = journal_first_sequence_ - 1;
     std::size_t offset = kJournalHeaderSize;
     while (offset < journal.size()) {

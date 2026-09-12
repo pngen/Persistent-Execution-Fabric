@@ -57,12 +57,15 @@ void close_handle(NativeHandle handle) {
 
 }  // namespace
 
+// The handle is atomic so that one thread may close a socket while another is
+// blocked reading from it, which is how the coordinator stops its connection
+// threads without waiting for clients to disconnect first.
 struct Socket::Native {
-    NativeHandle handle = kInvalidHandle;
+    std::atomic<std::intptr_t> handle{static_cast<std::intptr_t>(kInvalidHandle)};
 };
 
 struct Listener::Native {
-    NativeHandle handle = kInvalidHandle;
+    std::atomic<std::intptr_t> handle{static_cast<std::intptr_t>(kInvalidHandle)};
 };
 
 void net_initialize() {
@@ -104,15 +107,25 @@ Socket& Socket::operator=(Socket&& other) noexcept {
 
 Socket::~Socket() { close(); }
 
+namespace {
+
+[[nodiscard]] NativeHandle load_handle(const std::atomic<std::intptr_t>& handle) noexcept {
+    return static_cast<NativeHandle>(handle.load(std::memory_order_acquire));
+}
+
+}  // namespace
+
 bool Socket::valid() const noexcept {
-    return native_ != nullptr && native_->handle != kInvalidHandle;
+    return native_ != nullptr &&
+           load_handle(native_->handle) != kInvalidHandle;
 }
 
 void Socket::close() noexcept {
     if (native_ != nullptr) {
-        close_handle(native_->handle);
-        native_->handle = kInvalidHandle;
-        native_.reset();
+        const NativeHandle handle =
+            static_cast<NativeHandle>(native_->handle.exchange(
+                static_cast<std::intptr_t>(kInvalidHandle), std::memory_order_acq_rel));
+        close_handle(handle);
     }
 }
 
@@ -120,15 +133,16 @@ Status Socket::send_all(const void* data, std::size_t size) {
     if (!valid()) {
         return err(Code::TransportFailure, "send on a closed socket");
     }
+    const NativeHandle handle = load_handle(native_->handle);
     const auto* p = static_cast<const std::uint8_t*>(data);
     std::size_t remaining = size;
     while (remaining > 0) {
         const int chunk = static_cast<int>(remaining > 1u << 20 ? 1u << 20 : remaining);
 #if defined(_WIN32)
-        const int sent = ::send(native_->handle, reinterpret_cast<const char*>(p), chunk, 0);
+        const int sent = ::send(handle, reinterpret_cast<const char*>(p), chunk, 0);
 #else
-        const int sent = static_cast<int>(
-            ::send(native_->handle, p, static_cast<std::size_t>(chunk), MSG_NOSIGNAL));
+        const int sent =
+            static_cast<int>(::send(handle, p, static_cast<std::size_t>(chunk), MSG_NOSIGNAL));
 #endif
         if (sent <= 0) {
             return err(Code::TransportFailure, "send failed: " + socket_error_text());
@@ -159,11 +173,15 @@ Status Socket::recv_some(void* data, std::size_t size, std::size_t& received) {
     if (!valid()) {
         return err(Code::TransportFailure, "receive on a closed socket");
     }
+    const NativeHandle handle = load_handle(native_->handle);
+    if (handle == kInvalidHandle) {
+        return err(Code::TransportFailure, "receive on a closed socket");
+    }
     const int chunk = static_cast<int>(size > 1u << 20 ? 1u << 20 : size);
 #if defined(_WIN32)
-    const int got = ::recv(native_->handle, static_cast<char*>(data), chunk, 0);
+    const int got = ::recv(handle, static_cast<char*>(data), chunk, 0);
 #else
-    const int got = static_cast<int>(::recv(native_->handle, data, static_cast<std::size_t>(chunk), 0));
+    const int got = static_cast<int>(::recv(handle, data, static_cast<std::size_t>(chunk), 0));
 #endif
     if (got < 0) {
         return err(Code::TransportFailure, "receive failed: " + socket_error_text());
@@ -173,36 +191,39 @@ Status Socket::recv_some(void* data, std::size_t size, std::size_t& received) {
 }
 
 void Socket::set_read_timeout_ms(int milliseconds) {
-    if (!valid()) {
+    const NativeHandle handle = native_ == nullptr ? kInvalidHandle : load_handle(native_->handle);
+    if (handle == kInvalidHandle) {
         return;
     }
 #if defined(_WIN32)
     const DWORD timeout = static_cast<DWORD>(milliseconds);
-    ::setsockopt(native_->handle, SOL_SOCKET, SO_RCVTIMEO,
-                 reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    ::setsockopt(handle, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout),
+                 sizeof(timeout));
 #else
     struct timeval tv {};
     tv.tv_sec = milliseconds / 1000;
     tv.tv_usec = (milliseconds % 1000) * 1000;
-    ::setsockopt(native_->handle, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(handle, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 }
 
 void Socket::set_no_delay(bool enabled) {
-    if (!valid()) {
+    const NativeHandle handle = native_ == nullptr ? kInvalidHandle : load_handle(native_->handle);
+    if (handle == kInvalidHandle) {
         return;
     }
     const int value = enabled ? 1 : 0;
 #if defined(_WIN32)
-    ::setsockopt(native_->handle, IPPROTO_TCP, TCP_NODELAY,
-                 reinterpret_cast<const char*>(&value), sizeof(value));
+    ::setsockopt(handle, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&value),
+                 sizeof(value));
 #else
-    ::setsockopt(native_->handle, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
+    ::setsockopt(handle, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
 #endif
 }
 
 std::uint16_t Socket::local_port() const {
-    if (!valid()) {
+    const NativeHandle handle = native_ == nullptr ? kInvalidHandle : load_handle(native_->handle);
+    if (handle == kInvalidHandle) {
         return 0;
     }
     sockaddr_in address{};
@@ -211,7 +232,7 @@ std::uint16_t Socket::local_port() const {
 #else
     socklen_t length = sizeof(address);
 #endif
-    if (::getsockname(native_->handle, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+    if (::getsockname(handle, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
         return 0;
     }
     return ntohs(address.sin_port);
@@ -222,14 +243,14 @@ Listener::Listener() = default;
 Listener::~Listener() { close(); }
 
 bool Listener::valid() const noexcept {
-    return native_ != nullptr && native_->handle != kInvalidHandle;
+    return native_ != nullptr && load_handle(native_->handle) != kInvalidHandle;
 }
 
 void Listener::close() noexcept {
     if (native_ != nullptr) {
-        close_handle(native_->handle);
-        native_->handle = kInvalidHandle;
-        native_.reset();
+        const NativeHandle handle = static_cast<NativeHandle>(native_->handle.exchange(
+            static_cast<std::intptr_t>(kInvalidHandle), std::memory_order_acq_rel));
+        close_handle(handle);
     }
 }
 
@@ -278,12 +299,13 @@ Status Listener::listen_on(const std::string& host, std::uint16_t port) {
         port_ = port;
     }
     native_ = std::make_unique<Native>();
-    native_->handle = handle;
+    native_->handle.store(static_cast<std::intptr_t>(handle), std::memory_order_release);
     return ok_status();
 }
 
 Status Listener::accept(Socket& out) {
-    if (!valid()) {
+    const NativeHandle listener = native_ == nullptr ? kInvalidHandle : load_handle(native_->handle);
+    if (listener == kInvalidHandle) {
         return err(Code::TransportFailure, "accept on a closed listener");
     }
     sockaddr_in peer{};
@@ -292,8 +314,7 @@ Status Listener::accept(Socket& out) {
 #else
     socklen_t length = sizeof(peer);
 #endif
-    const NativeHandle handle =
-        ::accept(native_->handle, reinterpret_cast<sockaddr*>(&peer), &length);
+    const NativeHandle handle = ::accept(listener, reinterpret_cast<sockaddr*>(&peer), &length);
     if (handle == kInvalidHandle) {
         return err(Code::TransportFailure, "accept failed: " + socket_error_text());
     }
@@ -306,7 +327,7 @@ Status Listener::accept(Socket& out) {
 #endif
     out.close();
     auto native = std::make_unique<Socket::Native>();
-    native->handle = handle;
+    native->handle.store(static_cast<std::intptr_t>(handle), std::memory_order_release);
     out = Socket::adopt(std::move(native));
     return ok_status();
 }
@@ -373,23 +394,30 @@ Status connect_to(const std::string& host, std::uint16_t port, Socket& out, int 
     }
     out.close();
     auto native = std::make_unique<Socket::Native>();
-    native->handle = handle;
+    native->handle.store(static_cast<std::intptr_t>(handle), std::memory_order_release);
     out = Socket::adopt(std::move(native));
     return ok_status();
 }
 
-FrameChannel::FrameChannel(Socket socket) : socket_(std::move(socket)) {}
+FrameChannel::FrameChannel(Socket socket)
+    : socket_(std::make_shared<Socket>(std::move(socket))) {}
 
-void FrameChannel::close() noexcept { socket_.close(); }
+FrameChannel::FrameChannel(std::shared_ptr<Socket> socket) : socket_(std::move(socket)) {}
+
+void FrameChannel::close() noexcept {
+    if (socket_) {
+        socket_->close();
+    }
+}
 
 Status FrameChannel::send(const Frame& frame) {
     const Bytes bytes = encode_frame(frame);
-    return socket_.send_all(bytes.data(), bytes.size());
+    return socket_->send_all(bytes.data(), bytes.size());
 }
 
 Status FrameChannel::receive(Frame& out, std::string& reason) {
     std::uint8_t header[kFrameHeaderSize] = {};
-    PEF_TRY(socket_.recv_exact(header, kFrameHeaderSize));
+    PEF_TRY(socket_->recv_exact(header, kFrameHeaderSize));
     Frame partial;
     if (!decode_frame_header(header, kFrameHeaderSize, partial, reason)) {
         return err(Code::ProtocolViolation, reason);
@@ -402,10 +430,10 @@ Status FrameChannel::receive(Frame& out, std::string& reason) {
                 std::byte{0});
     std::memcpy(whole.data(), header, kFrameHeaderSize);
     if (payload_size > 0) {
-        PEF_TRY(socket_.recv_exact(whole.data() + kFrameHeaderSize, payload_size));
+        PEF_TRY(socket_->recv_exact(whole.data() + kFrameHeaderSize, payload_size));
     }
-    PEF_TRY(socket_.recv_exact(whole.data() + kFrameHeaderSize + payload_size,
-                               kFrameTrailerSize));
+    PEF_TRY(socket_->recv_exact(whole.data() + kFrameHeaderSize + payload_size,
+                                kFrameTrailerSize));
     if (!decode_frame(whole, out, reason)) {
         return err(Code::ProtocolViolation, reason);
     }

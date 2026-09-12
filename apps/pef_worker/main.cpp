@@ -287,9 +287,7 @@ int main(int argc, char** argv) {
         BeginActionRequest begin;
         begin.request = client.next_request();
         begin.token = token;
-        begin.effect_class = effect_class == SideEffectClass::Pure
-                                 ? SideEffectClass::NonRepeatable
-                                 : effect_class;
+        begin.effect_class = effect_class;
         begin.request_key = request_key;
         begin.evidence.kind = EvidenceKind::Real;
         begin.evidence.source = "worker";
@@ -402,6 +400,20 @@ int main(int argc, char** argv) {
     }
 
     const int hold_ms = args.int_or("--hold-ms", 0);
+    if (hold_ms < 0) {
+        // Hold the lease open indefinitely so that the harness can kill this
+        // process at a chosen moment rather than racing a fixed duration.
+        app::print_line("WORKER HOLDING");
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            PingReply pong;
+            if (!client.ping(pong).ok()) {
+                break;
+            }
+        }
+        app::print_line("WORKER CONNECTION LOST");
+        return 0;
+    }
     if (hold_ms > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
     }

@@ -160,8 +160,30 @@ if(PEF_BUILD_TESTS)
         add_test(NAME ${target_name} COMMAND ${target_name})
     endfunction()
 
+    add_library(pef_process_support STATIC tests/process_helper.cpp)
+    target_include_directories(pef_process_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(pef_process_support PUBLIC pef)
+    pef_apply_warnings(pef_process_support)
+
+    function(pef_add_multiprocess_test target_name)
+        add_executable(${target_name} tests/test_main.cpp ${ARGN})
+        target_link_libraries(${target_name} PRIVATE pef_test_support pef_process_support)
+        target_compile_definitions(${target_name} PRIVATE
+            PEF_COORDINATOR_EXE="$<TARGET_FILE:pef_coordinator>"
+            PEF_WORKER_EXE="$<TARGET_FILE:pef_worker>"
+            PEF_CLI_EXE="$<TARGET_FILE:pef_cli>")
+        add_dependencies(${target_name} pef_coordinator pef_worker pef_cli)
+        pef_apply_warnings(${target_name})
+        add_test(NAME ${target_name} COMMAND ${target_name})
+        set_tests_properties(${target_name} PROPERTIES TIMEOUT 900)
+    endfunction()
+
     pef_add_test(pef_tests_core tests/test_core.cpp)
     pef_add_test(pef_tests_runtime tests/test_runtime.cpp)
+
+    if(PEF_BUILD_TOOLS)
+        pef_add_multiprocess_test(pef_tests_multiprocess tests/test_multiprocess.cpp)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
