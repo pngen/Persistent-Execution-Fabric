@@ -695,15 +695,17 @@ pef_benchmarks measures **completed work**, not submission latency: every measur
 
 | Measurement | n | per operation | Notes |
 |---|---|---|---|
-| execution create | 100,000 | ~2 µs | journaled mode |
-| progress commit | 100,000 | ~16 µs | journaled mode, flat from 1,000 to 100,000 |
-| execution query | 1,000 | ~13 µs | independent of history length |
-| continuation validate | 1,000 | ~13 µs | |
-| recovery classify | 1,000 | ~14 µs | |
-| snapshot and compaction | 20,000 actions | ~54 ms | |
-| snapshot load | 20,000 actions | ~43 ms | |
-| invariant audit | 20,000 actions | ~9 ms | |
-| **durable commit** | 2,000 | **~2.6 ms** | DurableOnCommit: a flush to stable storage before acknowledgement |
+| progress commit (journaled) | 100,000 | 15.6 µs | flat: 12.8 µs at 10,000, 15.6 µs at 100,000 |
+| execution create (journaled) | 100,000 | ~2 µs | |
+| execution query | 1,000 | 12.4 µs | independent of history length |
+| continuation validate | 1,000 | 0.064 µs | pure function of durable state |
+| recovery classify | 1,000 | 0.386 µs | pure function of durable state |
+| checkpoint register (journaled) | 64 | 35.6 µs | |
+| invariant audit | 100,000 actions | 69.8 ms | 3.98 ms at 10,000; 387 µs at 1,000 |
+| snapshot and compaction | 100,000 actions | 212 ms | 28.6 ms at 10,000 |
+| snapshot load | 100,000 actions | 184 ms | 26 ms at 10,000 |
+| **durable progress commit** | 800 | **2,556 µs** | DurableOnCommit: a flush to stable storage before acknowledgement |
+| **durable checkpoint register** | 64 | **5,148 µs** | same flush cost per durable transition |
 
 Durable commits are two orders of magnitude more expensive than journaled commits. That is the honest cost of the durability contract, and it is why DurabilityMode is an explicit policy field rather than a hidden default. Choose DurableOnCommit when an acknowledged transition must survive a host power loss; choose JournaledNotFlushed when the host's write-back cache is trusted and throughput matters, and take explicit barriers.
 
