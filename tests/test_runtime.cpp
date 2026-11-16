@@ -870,3 +870,553 @@ PEF_TEST(runtime, request_identity_makes_creation_idempotent) {
     PEF_REQUIRE(ctx, fixture.runtime.list_executions(all).ok());
     PEF_CHECK(ctx, all.size() == 1);
 }
+
+// ---------------------------------------------------------------------------
+// Interrupted actions: what recovery and resume must never skip.
+// ---------------------------------------------------------------------------
+namespace {
+
+// One execution driven through the runtime, with the token its current worker
+// holds. Request identities are minted from a counter private to the case.
+struct Driver {
+    Fixture& fixture;
+    std::uint64_t counter;
+    CreateExecutionResult created;
+    LeaseToken token;
+
+    Driver(Fixture& f, std::uint64_t first_request) : fixture(f), counter(first_request) {}
+
+    [[nodiscard]] RequestId request() { return RequestId{counter++}; }
+
+    [[nodiscard]] Status create(const ExecutionPolicy& policy) {
+        CreateExecutionRequest create_request;
+        create_request.request = request();
+        create_request.policy = policy;
+        return fixture.runtime.create_execution(fixture.caller, create_request, created);
+    }
+
+    [[nodiscard]] Status bind(const char* name) {
+        BindWorkerRequest bind_request;
+        bind_request.request = request();
+        bind_request.execution = created.execution;
+        bind_request.worker = derive_worker_id(name);
+        bind_request.boot = mint_worker_boot_id(bind_request.worker);
+        BindWorkerResult bound;
+        PEF_TRY(fixture.runtime.bind_worker(fixture.caller, bind_request, bound));
+        token.execution = created.execution;
+        token.execution_generation = created.generation;
+        token.incarnation = bound.incarnation;
+        token.incarnation_generation = bound.incarnation_generation;
+        token.lease = bound.lease;
+        token.lease_generation = bound.lease_generation;
+        token.epoch = fixture.runtime.epoch();
+        token.worker = bind_request.worker;
+        token.boot = bind_request.boot;
+        token.policy_generation = created.policy_generation;
+        return ok_status();
+    }
+
+    [[nodiscard]] Status start() {
+        StartRequest start_request;
+        start_request.request = request();
+        start_request.token = token;
+        return fixture.runtime.start(start_request);
+    }
+
+    [[nodiscard]] Status begin(SideEffectClass cls, BeginActionResult& out) {
+        BeginActionRequest begin_request;
+        begin_request.request = request();
+        begin_request.token = token;
+        begin_request.effect_class = cls;
+        return fixture.runtime.begin_action(begin_request, out);
+    }
+
+    [[nodiscard]] Status complete(const BeginActionResult& action) {
+        CompleteActionRequest complete_request;
+        complete_request.request = request();
+        complete_request.token = token;
+        complete_request.action = action.action;
+        complete_request.action_generation = action.action_generation;
+        complete_request.completion.effect_applied = true;
+        complete_request.completion.evidence.kind = EvidenceKind::Real;
+        complete_request.completion.evidence.source = "unit-test";
+        CompleteActionResult committed;
+        return fixture.runtime.complete_action(complete_request, committed);
+    }
+
+    [[nodiscard]] Status fail(const BeginActionResult& action) {
+        FailActionRequest fail_request;
+        fail_request.request = request();
+        fail_request.token = token;
+        fail_request.action = action.action;
+        fail_request.action_generation = action.action_generation;
+        fail_request.evidence.kind = EvidenceKind::Real;
+        fail_request.evidence.source = "unit-test";
+        return fixture.runtime.fail_action(fail_request);
+    }
+
+    [[nodiscard]] Status report(const BeginActionResult& action, bool applied) {
+        ReportSideEffectRequest receipt;
+        receipt.request = request();
+        receipt.token = token;
+        receipt.action = action.action;
+        receipt.action_generation = action.action_generation;
+        receipt.applied = applied;
+        receipt.evidence.kind = EvidenceKind::Real;
+        receipt.evidence.source = "external-receipt";
+        return fixture.runtime.report_side_effect(receipt);
+    }
+
+    [[nodiscard]] Status fence() {
+        return fixture.runtime.fence(fixture.caller, request(), created.execution, "worker lost");
+    }
+
+    [[nodiscard]] Status recover(RecoveryOutcome& out) {
+        return fixture.runtime.recover(fixture.caller, request(), created.execution, out);
+    }
+
+    [[nodiscard]] Status resume(ResumeResult& out) {
+        ResumeRequest resume_request;
+        resume_request.request = request();
+        resume_request.token = token;
+        resume_request.revalidate_bindings = true;
+        return fixture.runtime.resume(resume_request, out);
+    }
+
+    [[nodiscard]] Status resolve(AmbiguityState resolution) {
+        ExecutionView view;
+        PEF_TRY(fixture.runtime.query(created.execution, view));
+        ResolveAmbiguityRequest resolve_request;
+        resolve_request.request = request();
+        resolve_request.caller = fixture.caller;
+        resolve_request.execution = created.execution;
+        resolve_request.ambiguity = view.execution.ambiguity;
+        resolve_request.ambiguity_generation = view.execution.ambiguity_generation;
+        resolve_request.resolution = resolution;
+        resolve_request.evidence.kind = EvidenceKind::Synthetic;
+        resolve_request.evidence.source = "operator";
+        ResolveAmbiguityResult resolved;
+        return fixture.runtime.resolve_ambiguity(resolve_request, resolved);
+    }
+
+    [[nodiscard]] ActionStatus status_of(const BeginActionResult& action) {
+        ExecutionView view;
+        if (!fixture.runtime.query(created.execution, view).ok()) {
+            return ActionStatus::Prepared;
+        }
+        for (const ActionRecord& record : view.actions) {
+            if (record.id == action.action && record.generation == action.action_generation) {
+                return record.status;
+            }
+        }
+        return ActionStatus::Prepared;
+    }
+
+    [[nodiscard]] Lifecycle lifecycle() {
+        ExecutionView view;
+        if (!fixture.runtime.query(created.execution, view).ok()) {
+            return Lifecycle::Retired;
+        }
+        return view.execution.lifecycle;
+    }
+};
+
+// Journaled without a device flush per record: these cases dispatch many
+// actions and assert classification, not durability timing.
+[[nodiscard]] ExecutionPolicy unflushed_policy() {
+    ExecutionPolicy policy = test_policy();
+    policy.durability = DurabilityMode::JournaledNotFlushed;
+    return policy;
+}
+
+}  // namespace
+
+PEF_TEST(runtime, interrupted_frontier_action_is_classified_whatever_its_identity) {
+    PEF_PHASE(ctx, SETUP);
+    Fixture fixture("frontier-identity");
+    PEF_REQUIRE(ctx, fixture.open().ok());
+
+    // An action identity is a derived hash, so the interrupted action is not
+    // the one with the largest identity. Several executions make the outcome
+    // independent of how the identities happen to fall.
+    for (std::uint64_t round = 0; round < 8; ++round) {
+        PEF_PHASE(ctx, ACTION);
+        Driver driver(fixture, 1000 + round * 100);
+        PEF_REQUIRE(ctx, driver.create(unflushed_policy()).ok());
+        PEF_REQUIRE(ctx, driver.bind("worker-frontier").ok());
+        PEF_REQUIRE(ctx, driver.start().ok());
+        for (int step = 0; step < 6; ++step) {
+            BeginActionResult action;
+            PEF_REQUIRE(ctx, driver.begin(SideEffectClass::Pure, action).ok());
+            PEF_REQUIRE(ctx, driver.complete(action).ok());
+        }
+        BeginActionResult interrupted;
+        PEF_REQUIRE(ctx, driver.begin(SideEffectClass::NonRepeatable, interrupted).ok());
+        PEF_CHECK(ctx, interrupted.ordinal == 7);
+
+        PEF_PHASE(ctx, KILL);
+        PEF_REQUIRE(ctx, driver.fence().ok());
+
+        PEF_PHASE(ctx, AMBIGUITY);
+        RecoveryOutcome recovered;
+        PEF_REQUIRE(ctx, driver.recover(recovered).ok());
+        PEF_CHECK_MSG(ctx, recovered.plan.decision == RecoveryDecision::AmbiguousCompletion,
+                      "round " + std::to_string(round) + ": the interrupted action was not seen: " +
+                          std::string(recovery_decision_name(recovered.plan.decision)));
+        PEF_CHECK(ctx, recovered.plan.action == interrupted.action);
+        ExecutionView view;
+        PEF_REQUIRE(ctx, fixture.runtime.query(driver.created.execution, view).ok());
+        PEF_CHECK(ctx, view.execution.blocked);
+        PEF_CHECK(ctx, view.execution.blocked_above_ordinal == 6);
+        PEF_CHECK(ctx, driver.status_of(interrupted) == ActionStatus::Ambiguous);
+        // The view lists the newest actions first.
+        PEF_CHECK(ctx, !view.actions.empty() && view.actions.front().sequence == 7);
+    }
+
+    PEF_PHASE(ctx, VERIFY);
+    AuditReport audit;
+    PEF_REQUIRE(ctx, fixture.runtime.audit(audit).ok());
+    PEF_CHECK_MSG(ctx, audit.clean(), audit.render());
+}
+
+PEF_TEST(runtime, failed_frontier_action_is_redriven_as_the_same_logical_action) {
+    PEF_PHASE(ctx, SETUP);
+    Fixture fixture("frontier-replay");
+    PEF_REQUIRE(ctx, fixture.open().ok());
+
+    for (std::uint64_t round = 0; round < 6; ++round) {
+        PEF_PHASE(ctx, ACTION);
+        Driver driver(fixture, 2000 + round * 100);
+        PEF_REQUIRE(ctx, driver.create(unflushed_policy()).ok());
+        PEF_REQUIRE(ctx, driver.bind("worker-replay").ok());
+        PEF_REQUIRE(ctx, driver.start().ok());
+        for (int step = 0; step < 5; ++step) {
+            BeginActionResult action;
+            PEF_REQUIRE(ctx, driver.begin(SideEffectClass::Pure, action).ok());
+            PEF_REQUIRE(ctx, driver.complete(action).ok());
+        }
+        BeginActionResult failed;
+        PEF_REQUIRE(ctx, driver.begin(SideEffectClass::Idempotent, failed).ok());
+        PEF_REQUIRE(ctx, driver.fail(failed).ok());
+
+        PEF_PHASE(ctx, REPLAY);
+        BeginActionResult again;
+        PEF_REQUIRE(ctx, driver.begin(SideEffectClass::Idempotent, again).ok());
+        PEF_CHECK_MSG(ctx, again.action == failed.action && again.ordinal == failed.ordinal,
+                      "round " + std::to_string(round) +
+                          ": a new logical action was invented at ordinal " +
+                          std::to_string(again.ordinal));
+        PEF_CHECK(ctx, again.action_generation.value() == 2);
+        ExecutionView view;
+        PEF_REQUIRE(ctx, fixture.runtime.query(driver.created.execution, view).ok());
+        PEF_CHECK(ctx, view.execution.action_frontier == 6);
+        PEF_CHECK(ctx, view.execution.replay_count == 1);
+    }
+}
+
+PEF_TEST(runtime, earlier_interrupted_action_decides_recovery) {
+    PEF_PHASE(ctx, SETUP);
+    Fixture fixture("earlier-in-flight");
+    PEF_REQUIRE(ctx, fixture.open().ok());
+
+    for (std::uint64_t round = 0; round < 6; ++round) {
+        PEF_PHASE(ctx, ACTION);
+        Driver driver(fixture, 3000 + round * 100);
+        PEF_REQUIRE(ctx, driver.create(unflushed_policy()).ok());
+        PEF_REQUIRE(ctx, driver.bind("worker-concurrent").ok());
+        PEF_REQUIRE(ctx, driver.start().ok());
+        // One action that may never be repeated, then replay-safe actions
+        // dispatched after it. All of them are in flight when the worker dies.
+        BeginActionResult unsafe;
+        PEF_REQUIRE(ctx, driver.begin(SideEffectClass::NonRepeatable, unsafe).ok());
+        for (int step = 0; step < 5; ++step) {
+            BeginActionResult later;
+            PEF_REQUIRE(ctx, driver.begin(SideEffectClass::Pure, later).ok());
+        }
+
+        PEF_PHASE(ctx, KILL);
+        PEF_REQUIRE(ctx, driver.fence().ok());
+
+        PEF_PHASE(ctx, AMBIGUITY);
+        RecoveryOutcome recovered;
+        PEF_REQUIRE(ctx, driver.recover(recovered).ok());
+        PEF_CHECK_MSG(ctx, recovered.plan.decision == RecoveryDecision::AmbiguousCompletion,
+                      "round " + std::to_string(round) +
+                          ": an action of unknown outcome was passed over: " +
+                          std::string(recovery_decision_name(recovered.plan.decision)));
+        PEF_CHECK(ctx, recovered.plan.action == unsafe.action);
+        ExecutionView view;
+        PEF_REQUIRE(ctx, fixture.runtime.query(driver.created.execution, view).ok());
+        PEF_CHECK(ctx, view.execution.blocked);
+        PEF_CHECK(ctx, view.execution.blocked_above_ordinal == 0);
+        PEF_CHECK(ctx, driver.status_of(unsafe) == ActionStatus::Ambiguous);
+
+        // A replacement cannot continue past it.
+        PEF_REQUIRE(ctx, driver.bind("worker-concurrent-replacement").ok());
+        ResumeResult resumed;
+        PEF_CHECK(ctx, !driver.resume(resumed).ok());
+        PEF_CHECK(ctx, driver.lifecycle() != Lifecycle::Running);
+    }
+
+    PEF_PHASE(ctx, VERIFY);
+    AuditReport audit;
+    PEF_REQUIRE(ctx, fixture.runtime.audit(audit).ok());
+    PEF_CHECK_MSG(ctx, audit.clean(), audit.render());
+}
+
+PEF_TEST(runtime, replacement_cannot_resume_past_an_unclassified_action) {
+    PEF_PHASE(ctx, SETUP);
+    Fixture fixture("stale-recovery");
+    PEF_REQUIRE(ctx, fixture.open().ok());
+    Driver driver(fixture, 4000);
+    PEF_REQUIRE(ctx, driver.create(test_policy()).ok());
+    PEF_REQUIRE(ctx, driver.bind("worker-first").ok());
+    PEF_REQUIRE(ctx, driver.start().ok());
+
+    PEF_PHASE(ctx, RECOVER);
+    // A first interruption with nothing in flight is recovered and resumed.
+    PEF_REQUIRE(ctx, driver.fence().ok());
+    RecoveryOutcome first_recovery;
+    PEF_REQUIRE(ctx, driver.recover(first_recovery).ok());
+    PEF_CHECK(ctx, first_recovery.plan.decision == RecoveryDecision::ResumeFromCurrent);
+    PEF_REQUIRE(ctx, driver.bind("worker-second").ok());
+    ResumeResult resumed;
+    PEF_REQUIRE(ctx, driver.resume(resumed).ok());
+    PEF_CHECK(ctx, resumed.lifecycle == Lifecycle::Running);
+
+    PEF_PHASE(ctx, KILL);
+    // The second worker dies with a non-repeatable action in flight.
+    BeginActionResult interrupted;
+    PEF_REQUIRE(ctx, driver.begin(SideEffectClass::NonRepeatable, interrupted).ok());
+    PEF_REQUIRE(ctx, driver.fence().ok());
+    PEF_REQUIRE(ctx, driver.bind("worker-third").ok());
+    PEF_CHECK(ctx, driver.lifecycle() == Lifecycle::RecoveryRequired);
+
+    PEF_PHASE(ctx, RESUME);
+    // The recovery recorded for the first interruption says nothing about this
+    // one. Resume must not become authoritative on the strength of it.
+    ResumeResult stale;
+    const Status stale_status = driver.resume(stale);
+    PEF_CHECK_MSG(ctx, !stale_status.ok(),
+                  "an execution resumed past an action whose outcome was never classified");
+    PEF_CHECK(ctx, stale_status.code() == Code::LifecycleRefused);
+    PEF_CHECK(ctx, stale.decision == RecoveryDecision::AmbiguousCompletion);
+    PEF_CHECK(ctx, driver.lifecycle() == Lifecycle::RecoveryRequired);
+    BeginActionResult beyond;
+    PEF_CHECK(ctx, !driver.begin(SideEffectClass::Pure, beyond).ok());
+
+    PEF_PHASE(ctx, AMBIGUITY);
+    RecoveryOutcome second_recovery;
+    PEF_REQUIRE(ctx, driver.recover(second_recovery).ok());
+    PEF_CHECK(ctx, second_recovery.plan.decision == RecoveryDecision::AmbiguousCompletion);
+    PEF_CHECK(ctx, !driver.resume(stale).ok());
+
+    PEF_PHASE(ctx, COMMIT);
+    // Once the outcome is established, recovery and resume proceed.
+    PEF_REQUIRE(ctx, driver.resolve(AmbiguityState::ResolvedApplied).ok());
+    RecoveryOutcome third_recovery;
+    PEF_REQUIRE(ctx, driver.recover(third_recovery).ok());
+    PEF_REQUIRE(ctx, driver.resume(resumed).ok());
+    PEF_CHECK(ctx, resumed.lifecycle == Lifecycle::Running);
+    ExecutionView view;
+    PEF_REQUIRE(ctx, fixture.runtime.query(driver.created.execution, view).ok());
+    PEF_CHECK(ctx, view.execution.committed_actions == 1);
+
+    PEF_PHASE(ctx, VERIFY);
+    AuditReport audit;
+    PEF_REQUIRE(ctx, fixture.runtime.audit(audit).ok());
+    PEF_CHECK_MSG(ctx, audit.clean(), audit.render());
+}
+
+PEF_TEST(runtime, suspended_execution_does_not_resume_past_an_unclassified_action) {
+    PEF_PHASE(ctx, SETUP);
+    Fixture fixture("suspended-in-flight");
+    PEF_REQUIRE(ctx, fixture.open().ok());
+    Driver driver(fixture, 5000);
+    PEF_REQUIRE(ctx, driver.create(test_policy()).ok());
+    PEF_REQUIRE(ctx, driver.bind("worker-suspending").ok());
+    PEF_REQUIRE(ctx, driver.start().ok());
+    BeginActionResult interrupted;
+    PEF_REQUIRE(ctx, driver.begin(SideEffectClass::NonRepeatable, interrupted).ok());
+
+    PEF_PHASE(ctx, SUSPEND);
+    PEF_REQUIRE(ctx, fixture.runtime
+                         .suspend_begin(fixture.caller, driver.request(), driver.created.execution)
+                         .ok());
+    PEF_REQUIRE(ctx, fixture.runtime
+                         .suspend_commit(fixture.caller, driver.request(), driver.created.execution)
+                         .ok());
+    PEF_CHECK(ctx, driver.lifecycle() == Lifecycle::Suspended);
+
+    PEF_PHASE(ctx, RESUME);
+    PEF_REQUIRE(ctx, driver.bind("worker-resuming").ok());
+    ResumeResult resumed;
+    const Status refused = driver.resume(resumed);
+    PEF_CHECK_MSG(ctx, !refused.ok(),
+                  "a suspended execution resumed past an action whose outcome is unknown");
+    PEF_CHECK(ctx, driver.lifecycle() == Lifecycle::Suspended);
+
+    PEF_PHASE(ctx, RECOVER);
+    RecoveryOutcome recovered;
+    PEF_REQUIRE(ctx, driver.recover(recovered).ok());
+    PEF_CHECK(ctx, recovered.plan.decision == RecoveryDecision::AmbiguousCompletion);
+    PEF_REQUIRE(ctx, driver.resolve(AmbiguityState::ResolvedApplied).ok());
+    PEF_REQUIRE(ctx, driver.resume(resumed).ok());
+    PEF_CHECK(ctx, resumed.lifecycle == Lifecycle::Running);
+
+    PEF_PHASE(ctx, VERIFY);
+    AuditReport audit;
+    PEF_REQUIRE(ctx, fixture.runtime.audit(audit).ok());
+    PEF_CHECK_MSG(ctx, audit.clean(), audit.render());
+}
+
+PEF_TEST(runtime, receipt_for_another_executions_action_is_refused) {
+    PEF_PHASE(ctx, SETUP);
+    Fixture fixture("cross-receipt");
+    PEF_REQUIRE(ctx, fixture.open().ok());
+    Driver owner(fixture, 6000);
+    PEF_REQUIRE(ctx, owner.create(test_policy()).ok());
+    PEF_REQUIRE(ctx, owner.bind("worker-owner").ok());
+    PEF_REQUIRE(ctx, owner.start().ok());
+    Driver other(fixture, 6500);
+    PEF_REQUIRE(ctx, other.create(test_policy()).ok());
+    PEF_REQUIRE(ctx, other.bind("worker-other").ok());
+    PEF_REQUIRE(ctx, other.start().ok());
+
+    PEF_PHASE(ctx, ACTION);
+    BeginActionResult action;
+    PEF_REQUIRE(ctx, owner.begin(SideEffectClass::NonRepeatable, action).ok());
+
+    PEF_PHASE(ctx, VERIFY);
+    // A lease on one execution is not authority over another execution's action.
+    const Status status = other.report(action, false);
+    PEF_CHECK_MSG(ctx, !status.ok(),
+                  "a worker recorded a receipt for an action of an execution it does not hold");
+    PEF_CHECK(ctx, status.code() == Code::InvalidArgument);
+    PEF_CHECK(ctx, owner.status_of(action) == ActionStatus::InFlight);
+}
+
+PEF_TEST(runtime, recorded_outcome_cannot_be_overturned_into_a_replay) {
+    PEF_PHASE(ctx, SETUP);
+    Fixture fixture("sealed-outcome");
+    PEF_REQUIRE(ctx, fixture.open().ok());
+
+    PEF_PHASE(ctx, ACTION);
+    // A durable receipt states the effect applied.
+    Driver applied(fixture, 7000);
+    PEF_REQUIRE(ctx, applied.create(test_policy()).ok());
+    PEF_REQUIRE(ctx, applied.bind("worker-applied").ok());
+    PEF_REQUIRE(ctx, applied.start().ok());
+    BeginActionResult action;
+    PEF_REQUIRE(ctx, applied.begin(SideEffectClass::NonRepeatable, action).ok());
+    PEF_REQUIRE(ctx, applied.report(action, true).ok());
+
+    PEF_PHASE(ctx, VERIFY);
+    const Status withdrawn = applied.report(action, false);
+    PEF_CHECK_MSG(ctx, !withdrawn.ok(), "an applied receipt was withdrawn by a later receipt");
+    const Status failed = applied.fail(action);
+    PEF_CHECK_MSG(ctx, !failed.ok(), "an action with an applied receipt was recorded as failed");
+    PEF_CHECK(ctx, applied.status_of(action) == ActionStatus::EffectApplied);
+    BeginActionResult next;
+    PEF_REQUIRE(ctx, applied.begin(SideEffectClass::Pure, next).ok());
+    PEF_CHECK_MSG(ctx, next.ordinal == 2, "the applied action was admitted for replay");
+    // The receipt still commits the logical progress without a worker.
+    PEF_REQUIRE(ctx, applied.complete(next).ok());
+    PEF_REQUIRE(ctx, applied.fence().ok());
+    RecoveryOutcome recovered;
+    PEF_REQUIRE(ctx, applied.recover(recovered).ok());
+    PEF_CHECK(ctx, recovered.committed);
+    PEF_CHECK(ctx, applied.status_of(action) == ActionStatus::Committed);
+
+    PEF_PHASE(ctx, AMBIGUITY);
+    // An ambiguous action that an operator abandoned stays abandoned.
+    Driver abandoned(fixture, 7500);
+    PEF_REQUIRE(ctx, abandoned.create(test_policy()).ok());
+    PEF_REQUIRE(ctx, abandoned.bind("worker-abandoned").ok());
+    PEF_REQUIRE(ctx, abandoned.start().ok());
+    BeginActionResult unknown;
+    PEF_REQUIRE(ctx, abandoned.begin(SideEffectClass::NonRepeatable, unknown).ok());
+    PEF_REQUIRE(ctx, abandoned.fence().ok());
+    PEF_REQUIRE(ctx, abandoned.recover(recovered).ok());
+    PEF_REQUIRE(ctx, abandoned.resolve(AmbiguityState::Abandoned).ok());
+    PEF_REQUIRE(ctx, abandoned.recover(recovered).ok());
+    PEF_REQUIRE(ctx, abandoned.bind("worker-abandoned-replacement").ok());
+    ResumeResult resumed;
+    PEF_REQUIRE(ctx, abandoned.resume(resumed).ok());
+
+    PEF_PHASE(ctx, REPLAY);
+    const Status revived = abandoned.fail(unknown);
+    PEF_CHECK_MSG(ctx, !revived.ok(), "an abandoned action was recorded as failed");
+    PEF_CHECK(ctx, abandoned.status_of(unknown) == ActionStatus::Abandoned);
+    BeginActionResult after;
+    PEF_REQUIRE(ctx, abandoned.begin(SideEffectClass::Pure, after).ok());
+    PEF_CHECK_MSG(ctx, after.ordinal == 2, "the abandoned action was admitted for replay");
+
+    AuditReport audit;
+    PEF_REQUIRE(ctx, fixture.runtime.audit(audit).ok());
+    PEF_CHECK_MSG(ctx, audit.clean(), audit.render());
+}
+
+PEF_TEST(runtime, policy_forbidding_replay_refuses_to_redrive_a_failed_action) {
+    PEF_PHASE(ctx, SETUP);
+    Fixture fixture("forbid-replay");
+    PEF_REQUIRE(ctx, fixture.open().ok());
+    ExecutionPolicy policy = test_policy();
+    policy.replay_allowance = ReplayAllowance::ForbidReplay;
+    policy.allow_recompute = false;
+    Driver driver(fixture, 8000);
+    PEF_REQUIRE(ctx, driver.create(policy).ok());
+    PEF_REQUIRE(ctx, driver.bind("worker-forbid").ok());
+    PEF_REQUIRE(ctx, driver.start().ok());
+
+    PEF_PHASE(ctx, ACTION);
+    BeginActionResult action;
+    PEF_REQUIRE(ctx, driver.begin(SideEffectClass::Idempotent, action).ok());
+    PEF_REQUIRE(ctx, driver.fail(action).ok());
+
+    PEF_PHASE(ctx, REPLAY);
+    BeginActionResult again;
+    const Status status = driver.begin(SideEffectClass::Idempotent, again);
+    PEF_CHECK_MSG(ctx, !status.ok(), "a replay was admitted under a policy that forbids replay");
+    PEF_CHECK(ctx, status.code() == Code::PolicyRefused);
+    ExecutionView view;
+    PEF_REQUIRE(ctx, fixture.runtime.query(driver.created.execution, view).ok());
+    PEF_CHECK(ctx, view.execution.replay_count == 0);
+    PEF_CHECK(ctx, view.replays.empty());
+}
+
+PEF_TEST(runtime, execution_with_an_open_ambiguity_cannot_be_cancelled) {
+    PEF_PHASE(ctx, SETUP);
+    Fixture fixture("cancel-ambiguity");
+    PEF_REQUIRE(ctx, fixture.open().ok());
+    Driver driver(fixture, 9000);
+    PEF_REQUIRE(ctx, driver.create(test_policy()).ok());
+    PEF_REQUIRE(ctx, driver.bind("worker-cancel").ok());
+    PEF_REQUIRE(ctx, driver.start().ok());
+    BeginActionResult action;
+    PEF_REQUIRE(ctx, driver.begin(SideEffectClass::NonRepeatable, action).ok());
+    PEF_REQUIRE(ctx, driver.fence().ok());
+
+    PEF_PHASE(ctx, AMBIGUITY);
+    RecoveryOutcome recovered;
+    PEF_REQUIRE(ctx, driver.recover(recovered).ok());
+    PEF_REQUIRE(ctx, recovered.plan.decision == RecoveryDecision::AmbiguousCompletion);
+
+    PEF_PHASE(ctx, VERIFY);
+    const Status status = fixture.runtime.cancel(fixture.caller, driver.request(),
+                                                 driver.created.execution, "give up");
+    PEF_CHECK_MSG(ctx, !status.ok(), "an execution with an unresolved ambiguity was cancelled");
+    PEF_CHECK(ctx, status.code() == Code::UnresolvedAmbiguity);
+    AuditReport audit;
+    PEF_REQUIRE(ctx, fixture.runtime.audit(audit).ok());
+    PEF_CHECK_MSG(ctx, audit.clean(), audit.render());
+
+    // Abandoning the progress explicitly is what makes cancellation legal.
+    PEF_REQUIRE(ctx, driver.resolve(AmbiguityState::Abandoned).ok());
+    PEF_REQUIRE(ctx, fixture.runtime
+                         .cancel(fixture.caller, driver.request(), driver.created.execution,
+                                 "give up")
+                         .ok());
+    PEF_REQUIRE(ctx, fixture.runtime.audit(audit).ok());
+    PEF_CHECK_MSG(ctx, audit.clean(), audit.render());
+}

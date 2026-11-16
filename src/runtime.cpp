@@ -99,13 +99,33 @@ struct Runtime::Impl {
     std::unordered_map<SessionId, SessionInfo, IdHasher<SessionIdTag>> sessions;
     std::unordered_map<RequestId, CachedOutcome, IdHasher<RequestIdTag>> request_cache;
     std::deque<RequestId> request_order;
-    // Derived index: execution -> action keys in ascending ordinal order. It is
+    // One indexed action: its ordinal and its durable key. An ActionId is a
+    // derived hash, so ordering by the identity itself would make "the newest
+    // action" an arbitrary one. The index is therefore ordered by the action
+    // ordinal and, within one logical action, by generation.
+    struct IndexedAction {
+        std::uint64_t ordinal = 0;
+        ActionKey key;
+
+        friend bool operator<(const IndexedAction& a, const IndexedAction& b) {
+            if (a.ordinal != b.ordinal) {
+                return a.ordinal < b.ordinal;
+            }
+            if (a.key.generation != b.key.generation) {
+                return a.key.generation < b.key.generation;
+            }
+            return a.key.id < b.key.id;
+        }
+    };
+
+    // Derived index: execution -> actions in ascending ordinal order. It is
     // a pure function of durable state and is rebuilt on open.
     // Derived indexes: execution identity to the records that belong to it.
     // They are pure functions of durable state, rebuilt once on open, and
     // maintained in O(1) amortized on every write. Without them, a query or a
     // lookup would degrade to a scan of the whole store.
-    std::unordered_map<ExecutionId, std::vector<ActionKey>, IdHasher<ExecutionIdTag>> action_index;
+    std::unordered_map<ExecutionId, std::vector<IndexedAction>, IdHasher<ExecutionIdTag>>
+        action_index;
     std::unordered_map<ExecutionId, std::vector<CheckpointId>, IdHasher<ExecutionIdTag>>
         checkpoint_index;
     std::unordered_map<ExecutionId, std::vector<CommitId>, IdHasher<ExecutionIdTag>> commit_index;
@@ -117,7 +137,8 @@ struct Runtime::Impl {
         commit_index.clear();
         replay_index.clear();
         for (const auto& action : state.actions.insertion_order()) {
-            action_index[action.execution].push_back(ActionKey{action.id, action.generation});
+            action_index[action.execution].push_back(
+                IndexedAction{action.sequence, ActionKey{action.id, action.generation}});
         }
         for (const auto& checkpoint : state.checkpoints.insertion_order()) {
             checkpoint_index[checkpoint.execution].push_back(checkpoint.id);
@@ -129,36 +150,123 @@ struct Runtime::Impl {
             replay_index[replay.execution].push_back(replay.id);
         }
         for (auto& entry : action_index) {
-            std::sort(entry.second.begin(), entry.second.end(),
-                      [](const ActionKey& a, const ActionKey& b) { return a < b; });
+            std::sort(entry.second.begin(), entry.second.end());
         }
     }
 
-    // Action keys arrive in ascending ordinal order in the common case, so the
+    // Actions arrive in ascending ordinal order in the common case, so the
     // index is appended to rather than re-sorted on every insert.
     void index_action(const ActionRecord& action) {
-        auto& keys = action_index[action.execution];
-        const ActionKey key{action.id, action.generation};
-        if (!keys.empty() && !(keys.back() < key)) {
-            const auto position = std::lower_bound(keys.begin(), keys.end(), key);
-            if (position != keys.end() && *position == key) {
-                return;
-            }
-            keys.insert(position, key);
+        auto& entries = action_index[action.execution];
+        const IndexedAction entry{action.sequence, ActionKey{action.id, action.generation}};
+        if (entries.empty() || entries.back() < entry) {
+            entries.push_back(entry);
             return;
         }
-        if (!keys.empty() && keys.back() == key) {
+        const auto position = std::lower_bound(entries.begin(), entries.end(), entry);
+        if (position != entries.end() && !(entry < *position)) {
             return;
         }
-        keys.push_back(key);
+        entries.insert(position, entry);
     }
 
+    // The newest generation of the action with the highest ordinal.
     [[nodiscard]] const ActionRecord* latest_action(ExecutionId execution) const {
         const auto it = action_index.find(execution);
         if (it == action_index.end() || it->second.empty()) {
             return nullptr;
         }
-        return state.actions.find(it->second.back());
+        return state.actions.find(it->second.back().key);
+    }
+
+    // Builds the classifier input for one execution and classifies it.
+    //
+    // Several actions may be in flight at once, so the frontier action alone
+    // does not decide. An action that was dispatched and never reached a
+    // durable outcome is examined in ordinal order, and the first one whose
+    // classification does not permit automatic continuation decides: its
+    // physical outcome is unknown no matter what was dispatched after it. An
+    // action that holds a durable applied receipt is committed from that
+    // receipt, lowest ordinal first. Otherwise the frontier action decides.
+    [[nodiscard]] RecoveryPlan plan_recovery(const ExecutionRecord& execution) const {
+        RecoveryInput input;
+        input.execution = &execution;
+        input.policy = policy_of(execution);
+        input.epoch = state.epoch;
+        if (execution.checkpoint.valid()) {
+            const CheckpointRecord* checkpoint = state.checkpoints.find(execution.checkpoint);
+            if (checkpoint == nullptr || checkpoint->state == CheckpointState::Corrupt ||
+                checkpoint->state == CheckpointState::Unsupported) {
+                input.checkpoint_unusable = true;
+            } else if (checkpoint_can_seed_continuation(checkpoint->state)) {
+                input.current_checkpoint = checkpoint;
+            }
+        }
+        std::vector<const CheckpointRecord*> candidates;
+        for (const CheckpointRecord* checkpoint : state.checkpoints.canonical_order()) {
+            if (checkpoint->execution == execution.id &&
+                checkpoint_can_seed_continuation(checkpoint->state)) {
+                candidates.push_back(checkpoint);
+            }
+        }
+        std::stable_sort(candidates.begin(), candidates.end(),
+                         [](const CheckpointRecord* a, const CheckpointRecord* b) {
+                             return a->generation > b->generation;
+                         });
+        input.candidates = std::move(candidates);
+        if (execution.ambiguity.valid()) {
+            input.ambiguity = state.ambiguities.find(execution.ambiguity);
+        }
+
+        const ActionRecord* receipt_holder = nullptr;
+        if (const auto it = action_index.find(execution.id); it != action_index.end()) {
+            const auto& entries = it->second;
+            for (std::size_t i = 0; i < entries.size(); ++i) {
+                // Only the newest generation of a logical action is live.
+                if (i + 1 < entries.size() && entries[i + 1].ordinal == entries[i].ordinal) {
+                    continue;
+                }
+                const ActionRecord* action = state.actions.find(entries[i].key);
+                if (action == nullptr) {
+                    continue;
+                }
+                const bool undecided = action->status == ActionStatus::InFlight ||
+                                       action->status == ActionStatus::Prepared;
+                const bool applied = action->status == ActionStatus::EffectApplied ||
+                                     action->status == ActionStatus::CompletedUnacknowledged;
+                if (!undecided && !applied) {
+                    continue;
+                }
+                input.in_flight = action;
+                const RecoveryPlan plan = classify_recovery(input);
+                if (plan.action != action->id || plan.action_generation != action->generation) {
+                    // An earlier rule decided (terminal state, an open ambiguity,
+                    // an unusable checkpoint); it decides for every action.
+                    return plan;
+                }
+                if (!recovery_allows_automatic_continue(plan.decision)) {
+                    return plan;
+                }
+                if (applied && receipt_holder == nullptr) {
+                    receipt_holder = action;
+                }
+            }
+        }
+        input.in_flight = receipt_holder;
+        if (input.in_flight == nullptr) {
+            if (const ActionRecord* latest = latest_action(execution.id); latest != nullptr) {
+                switch (latest->status) {
+                    case ActionStatus::Committed:
+                    case ActionStatus::Compensated:
+                    case ActionStatus::Abandoned:
+                        break;
+                    default:
+                        input.in_flight = latest;
+                        break;
+                }
+            }
+        }
+        return classify_recovery(input);
     }
 
     // ---- persistence ------------------------------------------------------
@@ -1117,6 +1225,10 @@ Status Runtime::begin_action(const BeginActionRequest& request, BeginActionResul
         is_replay = true;
         ordinal = execution->action_frontier;
         generation = latest->generation.next();
+        if (policy != nullptr && policy->replay_allowance == ReplayAllowance::ForbidReplay) {
+            return err(Code::PolicyRefused,
+                       "policy forbids replay; the failed action cannot be re-driven");
+        }
         if (policy != nullptr && generation.value() > policy->max_replay_depth) {
             return err(Code::PolicyRefused,
                        "the replay depth bound for this action identity has been reached");
@@ -1324,6 +1436,18 @@ Status Runtime::fail_action(const FailActionRequest& request) {
     if (existing->status == ActionStatus::Ambiguous) {
         return err(Code::UnresolvedAmbiguity, "action is ambiguous and must be resolved");
     }
+    if (existing->status == ActionStatus::Abandoned ||
+        existing->status == ActionStatus::Compensated) {
+        return err(Code::UnresolvedAmbiguity,
+                   "action is sealed; a failure report cannot change its recorded outcome");
+    }
+    if (existing->status == ActionStatus::EffectApplied ||
+        existing->status == ActionStatus::CompletedUnacknowledged) {
+        // A failure would make the action re-drivable, and re-driving it would
+        // repeat an effect the durable receipt says already happened.
+        return err(Code::AmbiguousCompletion,
+                   "action holds a durable receipt stating the effect applied");
+    }
     ActionRecord action = *existing;
     action.status = ActionStatus::Failed;
     action.receipt = request.evidence;
@@ -1347,6 +1471,9 @@ Status Runtime::report_side_effect(const ReportSideEffectRequest& request) {
     if (existing == nullptr) {
         return err(Code::NotFound, "action is not present in the durable store");
     }
+    if (existing->execution != execution->id) {
+        return err(Code::InvalidArgument, "action does not belong to this execution");
+    }
     if (existing->status == ActionStatus::Committed) {
         return err(Code::DuplicateCommit, "action is already committed");
     }
@@ -1354,6 +1481,13 @@ Status Runtime::report_side_effect(const ReportSideEffectRequest& request) {
         existing->status == ActionStatus::Abandoned) {
         return err(Code::UnresolvedAmbiguity,
                    "action is sealed; a receipt cannot change its recorded outcome");
+    }
+    if (!request.applied && (existing->status == ActionStatus::EffectApplied ||
+                             existing->status == ActionStatus::CompletedUnacknowledged)) {
+        // Withdrawing an applied receipt would admit a replay of an effect that
+        // durable evidence says already happened.
+        return err(Code::AmbiguousCompletion,
+                   "a durable receipt already states the effect applied");
     }
     ActionRecord action = *existing;
     action.status = request.applied ? ActionStatus::EffectApplied : ActionStatus::EffectNotApplied;
@@ -1545,6 +1679,24 @@ Status Runtime::resume(const ResumeRequest& request, ResumeResult& out) {
                        std::string("recovery decision ") +
                            std::string(recovery_decision_name(decision)) +
                            " does not permit automatic continuation");
+        }
+    }
+
+    // Classification is a pure function of durable state, so it is evaluated
+    // again here. A recovery recorded for an earlier interruption, or none at
+    // all for a suspended execution, says nothing about an action that was
+    // dispatched afterwards and never reached a durable outcome.
+    {
+        const RecoveryPlan pending = impl_->plan_recovery(*execution);
+        if (pending.action.valid() && !recovery_allows_automatic_continue(pending.decision)) {
+            const ActionRecord* interrupted =
+                impl_->state.find_action(pending.action, pending.action_generation);
+            if (interrupted != nullptr && interrupted->status != ActionStatus::Ambiguous) {
+                out.decision = pending.decision;
+                return err(Code::LifecycleRefused,
+                           "an interrupted action has not been classified; recovery must be "
+                           "applied before execution may resume");
+            }
         }
     }
 
@@ -1751,52 +1903,7 @@ Status Runtime::classify(const CallerContext& caller, ExecutionId execution_id,
     if (execution == nullptr) {
         return err(Code::NotFound, "execution is not present in the durable store");
     }
-    RecoveryInput input;
-    input.execution = execution;
-    input.policy = impl_->policy_of(*execution);
-    input.epoch = impl_->state.epoch;
-
-    if (const ActionRecord* latest = impl_->latest_action(execution_id); latest != nullptr) {
-        switch (latest->status) {
-            case ActionStatus::Committed:
-            case ActionStatus::Compensated:
-            case ActionStatus::Abandoned:
-                break;
-            default:
-                input.in_flight = latest;
-                break;
-        }
-    }
-    if (execution->checkpoint.valid()) {
-        const CheckpointRecord* checkpoint = impl_->state.checkpoints.find(execution->checkpoint);
-        if (checkpoint == nullptr) {
-            input.checkpoint_unusable = true;
-        } else if (checkpoint->state == CheckpointState::Corrupt ||
-                   checkpoint->state == CheckpointState::Unsupported) {
-            input.checkpoint_unusable = true;
-        } else if (checkpoint_can_seed_continuation(checkpoint->state)) {
-            input.current_checkpoint = checkpoint;
-        }
-    }
-    std::vector<const CheckpointRecord*> candidates;
-    for (const CheckpointRecord* checkpoint : impl_->state.checkpoints.canonical_order()) {
-        if (checkpoint->execution != execution_id) {
-            continue;
-        }
-        if (!checkpoint_can_seed_continuation(checkpoint->state)) {
-            continue;
-        }
-        candidates.push_back(checkpoint);
-    }
-    std::stable_sort(candidates.begin(), candidates.end(),
-                     [](const CheckpointRecord* a, const CheckpointRecord* b) {
-                         return a->generation > b->generation;
-                     });
-    input.candidates = std::move(candidates);
-    if (execution->ambiguity.valid()) {
-        input.ambiguity = impl_->state.ambiguities.find(execution->ambiguity);
-    }
-    out = classify_recovery(input);
+    out = impl_->plan_recovery(*execution);
     return ok_status();
 }
 
@@ -1819,50 +1926,7 @@ Status Runtime::recover_locked(const CallerContext& caller, RequestId request,
                        std::string(lifecycle_name(execution->lifecycle)));
     }
 
-    RecoveryPlan plan;
-    {
-        RecoveryInput input;
-        input.execution = execution;
-        input.policy = impl_->policy_of(*execution);
-        input.epoch = impl_->state.epoch;
-        if (const ActionRecord* latest = impl_->latest_action(execution_id); latest != nullptr) {
-            switch (latest->status) {
-                case ActionStatus::Committed:
-                case ActionStatus::Compensated:
-                case ActionStatus::Abandoned:
-                    break;
-                default:
-                    input.in_flight = latest;
-                    break;
-            }
-        }
-        if (execution->checkpoint.valid()) {
-            const CheckpointRecord* checkpoint =
-                impl_->state.checkpoints.find(execution->checkpoint);
-            if (checkpoint == nullptr || checkpoint->state == CheckpointState::Corrupt ||
-                checkpoint->state == CheckpointState::Unsupported) {
-                input.checkpoint_unusable = true;
-            } else if (checkpoint_can_seed_continuation(checkpoint->state)) {
-                input.current_checkpoint = checkpoint;
-            }
-        }
-        std::vector<const CheckpointRecord*> candidates;
-        for (const CheckpointRecord* checkpoint : impl_->state.checkpoints.canonical_order()) {
-            if (checkpoint->execution == execution_id &&
-                checkpoint_can_seed_continuation(checkpoint->state)) {
-                candidates.push_back(checkpoint);
-            }
-        }
-        std::stable_sort(candidates.begin(), candidates.end(),
-                         [](const CheckpointRecord* a, const CheckpointRecord* b) {
-                             return a->generation > b->generation;
-                         });
-        input.candidates = std::move(candidates);
-        if (execution->ambiguity.valid()) {
-            input.ambiguity = impl_->state.ambiguities.find(execution->ambiguity);
-        }
-        plan = classify_recovery(input);
-    }
+    const RecoveryPlan plan = impl_->plan_recovery(*execution);
 
     const ExecutionPolicy* policy = impl_->policy_of(*execution);
     const bool flush = flush_for(policy);
@@ -2126,6 +2190,13 @@ Status Runtime::cancel(const CallerContext& caller, RequestId request, Execution
         return ok_status();
     }
     (void)reason;
+    if (execution->ambiguity.valid()) {
+        const AmbiguityRecord* ambiguity = impl_->state.ambiguities.find(execution->ambiguity);
+        if (ambiguity != nullptr && ambiguity_is_open(ambiguity->state)) {
+            return err(Code::UnresolvedAmbiguity,
+                       "an execution with an unresolved ambiguity cannot be cancelled");
+        }
+    }
     PEF_TRY(impl_->persist_transition(*execution, Lifecycle::Cancelled, "cancel", true));
     impl_->remember_request(request, CachedOutcome{Code::Ok, 0, 0});
     return ok_status();
@@ -2311,7 +2382,8 @@ Status Runtime::query(ExecutionId execution_id, ExecutionView& out) const {
             if (out.actions.size() >= impl_->config.max_view_actions) {
                 break;
             }
-            if (const ActionRecord* action = impl_->state.actions.find(*it); action != nullptr) {
+            if (const ActionRecord* action = impl_->state.actions.find(it->key);
+                action != nullptr) {
                 out.actions.push_back(*action);
             }
         }

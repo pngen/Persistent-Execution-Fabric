@@ -619,3 +619,108 @@ PEF_TEST(adversarial, hostile_persisted_payloads_are_refused) {
     PEF_CHECK(ctx, !apply_record(state, RecordKind::StoreMeta, garbage));
     PEF_CHECK(ctx, !apply_record(state, RecordKind::Barrier, garbage));
 }
+
+PEF_TEST(adversarial, snapshot_without_a_journal_is_a_complete_store) {
+    PEF_PHASE(ctx, SETUP);
+    Harness harness("adv-snapshot-only");
+    PEF_REQUIRE(ctx, harness.open().ok());
+    PEF_REQUIRE(ctx, harness.create_execution().ok());
+    const StoreId store = harness.runtime().store_id();
+    PEF_REQUIRE(ctx, harness.runtime().take_snapshot(true).ok());
+    PEF_REQUIRE(ctx, harness.runtime().shutdown().ok());
+
+    PEF_PHASE(ctx, PERSIST);
+    // The snapshot holds every record. A journal that is gone is what a crash
+    // while the journal was being replaced after that snapshot leaves behind.
+    const auto journal = harness.dir().path() / "pef.journal";
+    std::error_code ec;
+    PEF_REQUIRE(ctx, std::filesystem::remove(journal, ec));
+
+    PEF_PHASE(ctx, RESTART);
+    ExecutionId second;
+    {
+        Runtime restarted;
+        const Status opened = harness.open_fresh(restarted, false);
+        PEF_CHECK_MSG(ctx, opened.ok(), opened.to_string());
+        PEF_REQUIRE(ctx, opened.ok());
+        PEF_CHECK_MSG(ctx, restarted.store_id() == store, "the store changed its durable identity");
+        ExecutionView view;
+        PEF_REQUIRE(ctx, restarted.query(harness.execution(), view).ok());
+
+        // The store keeps persisting from where the snapshot ends.
+        CallerContext caller;
+        caller.epoch = restarted.epoch();
+        CreateExecutionRequest request;
+        request.request = RequestId{50};
+        request.policy.id = PolicyId{1};
+        request.policy.generation = PolicyGeneration{1};
+        CreateExecutionResult created;
+        PEF_REQUIRE(ctx, restarted.create_execution(caller, request, created).ok());
+        second = created.execution;
+        PEF_REQUIRE(ctx, restarted.take_snapshot(true).ok());
+        PEF_REQUIRE(ctx, restarted.shutdown().ok());
+    }
+    PEF_REQUIRE(ctx, std::filesystem::remove(journal, ec));
+
+    PEF_PHASE(ctx, VERIFY);
+    // Permission to create a store must not mint a second identity for one
+    // that already exists.
+    Runtime again;
+    const Status reopened = harness.open_fresh(again, true);
+    PEF_CHECK_MSG(ctx, reopened.ok(), reopened.to_string());
+    PEF_REQUIRE(ctx, reopened.ok());
+    PEF_CHECK(ctx, again.store_id() == store);
+    ExecutionView first_view;
+    PEF_CHECK(ctx, again.query(harness.execution(), first_view).ok());
+    ExecutionView second_view;
+    PEF_CHECK(ctx, again.query(second, second_view).ok());
+    AuditReport audit;
+    PEF_REQUIRE(ctx, again.audit(audit).ok());
+    PEF_CHECK_MSG(ctx, audit.clean(), audit.render());
+    PEF_REQUIRE(ctx, again.shutdown().ok());
+}
+
+PEF_TEST(adversarial, failed_journal_truncation_leaves_the_store_usable) {
+    PEF_PHASE(ctx, SETUP);
+    Harness harness("adv-truncate-fail");
+    PEF_REQUIRE(ctx, harness.open().ok());
+    PEF_REQUIRE(ctx, harness.create_execution().ok());
+
+    PEF_PHASE(ctx, PERSIST);
+    ExecutionId second;
+    {
+        // A second handle on the journal (a scanner, a backup tool) can make it
+        // impossible to replace on some platforms. Whether or not the journal
+        // was replaced, the store must still be able to persist afterwards.
+        std::ifstream held(harness.dir().path() / "pef.journal", std::ios::binary);
+        PEF_REQUIRE(ctx, held.is_open());
+        const Status snapshot = harness.runtime().take_snapshot(true);
+
+        CreateExecutionRequest request;
+        request.request = RequestId{60};
+        request.policy.id = PolicyId{1};
+        request.policy.generation = PolicyGeneration{1};
+        CreateExecutionResult created;
+        const Status status = harness.runtime().create_execution(harness.caller(), request, created);
+        PEF_CHECK_MSG(ctx, status.ok(),
+                      "the store stopped persisting after a snapshot that returned [" +
+                          snapshot.to_string() + "]: " + status.to_string());
+        PEF_REQUIRE(ctx, status.ok());
+        second = created.execution;
+    }
+    PEF_REQUIRE(ctx, harness.runtime().shutdown().ok());
+
+    PEF_PHASE(ctx, VERIFY);
+    Runtime restarted;
+    const Status reopened = harness.open_fresh(restarted, false);
+    PEF_CHECK_MSG(ctx, reopened.ok(), reopened.to_string());
+    PEF_REQUIRE(ctx, reopened.ok());
+    ExecutionView first_view;
+    PEF_CHECK(ctx, restarted.query(harness.execution(), first_view).ok());
+    ExecutionView second_view;
+    PEF_CHECK(ctx, restarted.query(second, second_view).ok());
+    AuditReport audit;
+    PEF_REQUIRE(ctx, restarted.audit(audit).ok());
+    PEF_CHECK_MSG(ctx, audit.clean(), audit.render());
+    PEF_REQUIRE(ctx, restarted.shutdown().ok());
+}

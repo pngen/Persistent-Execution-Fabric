@@ -38,6 +38,7 @@ constexpr std::size_t kRecordTrailerSize = 8;
 constexpr const char* kJournalName = "pef.journal";
 constexpr const char* kSnapshotName = "pef.snapshot";
 constexpr const char* kSnapshotTempName = "pef.snapshot.tmp";
+constexpr const char* kJournalTempName = "pef.journal.tmp";
 
 [[nodiscard]] std::uint64_t read_le64(const std::uint8_t* p) noexcept {
     std::uint64_t value = 0;
@@ -304,24 +305,20 @@ void NativeFile::close() noexcept {
     return h.digest();
 }
 
-[[nodiscard]] Status platform_remove(const std::filesystem::path& path) {
-    if (::DeleteFileW(path.c_str()) == 0) {
-        const DWORD e = ::GetLastError();
-        if (e == ERROR_FILE_NOT_FOUND) {
-            return ok_status();
-        }
-        return err(Code::PersistenceFailure, "DeleteFile failed: " + path.string());
-    }
-    return ok_status();
-}
-
 #else  // POSIX
 
 Status NativeFile::open_append(const std::filesystem::path& path) {
     close();
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    // Not O_APPEND: that mode ignores the write position, and the store must be
+    // able to position itself in front of a torn tail so that the next record
+    // replaces the unreadable bytes instead of landing behind them.
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT, 0644);
     if (fd < 0) {
         return err(Code::PersistenceFailure, "cannot open journal for append: " + path.string());
+    }
+    if (::lseek(fd, 0, SEEK_END) < 0) {
+        ::close(fd);
+        return err(Code::PersistenceFailure, "cannot seek journal to end: " + path.string());
     }
     handle_ = fd;
     return ok_status();
@@ -460,13 +457,6 @@ void NativeFile::close() noexcept {
     return value;
 }
 
-[[nodiscard]] Status platform_remove(const std::filesystem::path& path) {
-    if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
-        return err(Code::PersistenceFailure, "unlink failed: " + path.string());
-    }
-    return ok_status();
-}
-
 #endif
 
 // Builds a complete snapshot image.
@@ -515,6 +505,54 @@ void NativeFile::close() noexcept {
     const std::size_t trailer = kRecordHeaderSize + payload.size();
     write_le64(p + trailer, crc64_ecma(p, trailer));
     return image;
+}
+
+// Writes a journal that holds only its header beside the live one and swaps it
+// in with one atomic replace. At every instant the store therefore holds either
+// the previous journal or the complete new one, never a missing or half-written
+// header.
+[[nodiscard]] Status write_fresh_journal(const std::filesystem::path& directory, StoreId store,
+                                         std::uint64_t first_sequence) {
+    const auto tmp_path = directory / kJournalTempName;
+    {
+        NativeFile fresh;
+        PEF_TRY(fresh.open_truncate(tmp_path));
+        std::uint8_t header[kJournalHeaderSize] = {};
+        std::memcpy(header, kJournalMagic, 8);
+        write_le32(header + 8, kPersistenceSchemaVersion);
+        write_le16(header + 12, 0);
+        write_le16(header + 14, 0);
+        write_le64(header + 16, store.value());
+        write_le64(header + 24, first_sequence);
+        write_le64(header + 32, crc64_ecma(header, 32));
+        PEF_TRY(fresh.write(header, sizeof(header)));
+        PEF_TRY(fresh.flush());
+        fresh.close();
+    }
+    PEF_TRY(platform_atomic_replace(tmp_path, directory / kJournalName));
+    return platform_sync_directory(directory);
+}
+
+// Reads the identity a verified snapshot header carries. Used only to continue
+// a store whose journal is absent; the snapshot body is verified by load().
+[[nodiscard]] bool read_snapshot_identity(const std::filesystem::path& path,
+                                          std::size_t max_bytes, StoreId& store,
+                                          std::uint64_t& sequence) {
+    Bytes snapshot;
+    bool exists = false;
+    if (!platform_read_file(path, max_bytes, snapshot, exists).ok() || !exists) {
+        return false;
+    }
+    if (snapshot.size() < kSnapshotHeaderSize + kRecordTrailerSize) {
+        return false;
+    }
+    const auto* p = reinterpret_cast<const std::uint8_t*>(snapshot.data());
+    if (std::memcmp(p, kSnapshotMagic, 8) != 0 || read_le64(p + 48) != crc64_ecma(p, 48)) {
+        return false;
+    }
+    store = StoreId{read_le64(p + 16)};
+    sequence = read_le64(p + 24);
+    return store.valid();
 }
 
 struct RecordBoundary {
@@ -899,6 +937,9 @@ bool reconcile_state(DurableState& state, std::vector<CommitGroupRecord>& repair
 struct FileDurableStore::Impl {
     NativeFile journal;
     Bytes write_buffer;
+    // Byte offset at which the next record is written. It is not always the
+    // end of the file: a torn tail is overwritten in place.
+    std::uint64_t append_offset = 0;
 };
 
 FileDurableStore::FileDurableStore() : impl_(std::make_unique<Impl>()) {}
@@ -931,27 +972,26 @@ Status FileDurableStore::open(const std::filesystem::path& directory, bool creat
     const auto journal_path = directory_ / kJournalName;
     const bool journal_exists = platform_exists(journal_path);
     if (!journal_exists) {
-        if (!create_if_missing) {
-            return err(Code::NotFound, "journal missing in store: " + directory_.string());
+        StoreId snapshot_store;
+        std::uint64_t snapshot_sequence = 0;
+        if (read_snapshot_identity(directory_ / kSnapshotName, limits_.max_snapshot_payload,
+                                   snapshot_store, snapshot_sequence)) {
+            // A snapshot without a journal is a complete store: the snapshot
+            // holds every record up to its sequence. The journal continues that
+            // identity and that sequence; minting a new identity here would
+            // make the store contradict its own snapshot.
+            PEF_TRY(write_fresh_journal(directory_, snapshot_store, snapshot_sequence + 1));
+        } else {
+            if (!create_if_missing) {
+                return err(Code::NotFound, "journal missing in store: " + directory_.string());
+            }
+            // The store id is minted once, at creation, and persisted in the
+            // journal header. It is never derived from the directory path, so
+            // relocating a store directory does not silently change durable
+            // identity.
+            const StoreId fresh_store{platform_entropy64()};
+            PEF_TRY(write_fresh_journal(directory_, fresh_store, 1));
         }
-        // The store id is minted once, at creation, and persisted in the journal
-        // header. It is never derived from the directory path, so relocating a
-        // store directory does not silently change durable identity.
-        const StoreId fresh_store{platform_entropy64()};
-        NativeFile fresh;
-        PEF_TRY(fresh.open_truncate(journal_path));
-        std::uint8_t header[kJournalHeaderSize] = {};
-        std::memcpy(header, kJournalMagic, 8);
-        write_le32(header + 8, kPersistenceSchemaVersion);
-        write_le16(header + 12, 0);
-        write_le16(header + 14, 0);
-        write_le64(header + 16, fresh_store.value());
-        write_le64(header + 24, 1);
-        write_le64(header + 32, crc64_ecma(header, 32));
-        PEF_TRY(fresh.write(header, sizeof(header)));
-        PEF_TRY(fresh.flush());
-        fresh.close();
-        PEF_TRY(platform_sync_directory(directory_));
     }
 
     PEF_TRY(impl_->journal.open_append(journal_path));
@@ -1000,6 +1040,7 @@ Status FileDurableStore::open(const std::filesystem::path& directory, bool creat
     if (offset != journal.size()) {
         PEF_TRY(impl_->journal.seek(offset));
     }
+    impl_->append_offset = offset;
     open_ = true;
     return ok_status();
 }
@@ -1017,6 +1058,7 @@ Status FileDurableStore::append(RecordKind kind, const Bytes& payload, bool flus
     const std::uint64_t sequence = last_sequence_ + 1;
     const Bytes image = build_record_image(kind, sequence, payload);
     PEF_TRY(impl_->journal.write(image.data(), image.size()));
+    impl_->append_offset += image.size();
     if (flush_now) {
         PEF_TRY(impl_->journal.flush());
     }
@@ -1056,22 +1098,17 @@ Status FileDurableStore::write_snapshot(const DurableState& state, bool truncate
         PEF_TRY(impl_->journal.flush());
         impl_->journal.close();
         const auto journal_path = directory_ / kJournalName;
-        PEF_TRY(platform_remove(journal_path));
-        NativeFile fresh;
-        PEF_TRY(fresh.open_truncate(journal_path));
-        std::uint8_t header[kJournalHeaderSize] = {};
-        std::memcpy(header, kJournalMagic, 8);
-        write_le32(header + 8, kPersistenceSchemaVersion);
-        write_le16(header + 12, 0);
-        write_le16(header + 14, 0);
-        write_le64(header + 16, state.store.value());
-        write_le64(header + 24, state.sequence + 1);
-        write_le64(header + 32, crc64_ecma(header, 32));
-        PEF_TRY(fresh.write(header, sizeof(header)));
-        PEF_TRY(fresh.flush());
-        fresh.close();
-        PEF_TRY(platform_sync_directory(directory_));
+        const Status swapped = write_fresh_journal(directory_, state.store, state.sequence + 1);
+        // The store must stay able to persist whether or not the swap happened:
+        // the journal that is in place now is reopened either way.
         PEF_TRY(impl_->journal.open_append(journal_path));
+        if (!swapped.ok()) {
+            // The previous journal is still complete and still agrees with the
+            // new snapshot, which only makes its older records redundant.
+            PEF_TRY(impl_->journal.seek(impl_->append_offset));
+            return swapped;
+        }
+        impl_->append_offset = kJournalHeaderSize;
         journal_first_sequence_ = state.sequence + 1;
         last_sequence_ = state.sequence;
     }
