@@ -70,7 +70,20 @@ struct CoordinatorServer::Impl {
 
     std::mutex threads_mu;
     std::vector<std::thread> connection_threads;
+    // run() waits for the accept loop and stop() ends it, each on its own
+    // thread. accept_mu guards the thread object, so it is started and joined
+    // under one lock and joined exactly once.
+    std::mutex accept_mu;
     std::thread accept_thread;
+
+    // Whichever of run() and stop() gets here first joins; the other waits
+    // for it and finds nothing left to join.
+    void join_accept_thread() {
+        std::lock_guard<std::mutex> guard(accept_mu);
+        if (accept_thread.joinable()) {
+            accept_thread.join();
+        }
+    }
 
     // Serves one request/response exchange. A refusal is a successful exchange
     // that carries a refusal payload; a failing status means the connection
@@ -160,6 +173,7 @@ Status CoordinatorServer::run() {
     if (!impl_->running.load()) {
         return err(Code::NotFound, "server is not running");
     }
+    std::unique_lock<std::mutex> accept_guard(impl_->accept_mu);
     impl_->accept_thread = std::thread([this]() {
         while (!impl_->stop_requested.load()) {
             Socket socket;
@@ -216,7 +230,8 @@ Status CoordinatorServer::run() {
             });
         }
     });
-    impl_->accept_thread.join();
+    accept_guard.unlock();
+    impl_->join_accept_thread();
     impl_->accept_finished.store(true);
     return ok_status();
 }
@@ -227,9 +242,7 @@ Status CoordinatorServer::stop() {
     }
     impl_->stop_requested.store(true);
     impl_->listener.close();
-    if (impl_->accept_thread.joinable()) {
-        impl_->accept_thread.join();
-    }
+    impl_->join_accept_thread();
     // Closing an in-flight connection from another thread unblocks a read and
     // lets the connection thread finish, which is what makes shutdown while a
     // client is attached a bounded operation rather than a hang.

@@ -2,12 +2,15 @@
 // Copyright 2026 Summon Software Labs. Apache License 2.0.
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "pef/audit.hpp"
+#include "pef/net.hpp"
 #include "pef/runtime.hpp"
+#include "pef/server.hpp"
 #include "test_framework.hpp"
 
 using namespace pef;
@@ -566,4 +569,57 @@ PEF_TEST(concurrency, shutdown_racing_operations_is_idempotent) {
     PEF_REQUIRE(ctx, reloaded.audit(audit).ok());
     PEF_CHECK_MSG(ctx, audit.clean(), audit.render());
     PEF_REQUIRE(ctx, reloaded.shutdown().ok());
+}
+
+// Regression: run() blocks until the accept loop has ended, and stop() is the
+// call another thread makes to end it. Both joined the accept thread, at the
+// same time, and a thread can be joined once: one of the two calls failed with
+// a system_error instead of returning.
+PEF_TEST(concurrency, server_stop_from_another_thread_ends_run_cleanly) {
+    PEF_PHASE(ctx, SETUP);
+    peftest::TempStore dir("server-stop");
+    CoordinatorServer server;
+    ServerConfig config;
+    config.runtime.store_path = dir.path();
+    config.runtime.create_if_missing = true;
+    OpenOutcome outcome;
+    PEF_REQUIRE(ctx, server.start(config, outcome).ok());
+
+    std::atomic<bool> run_threw{false};
+    std::atomic<bool> run_ok{false};
+    std::thread runner([&]() {
+        try {
+            run_ok.store(server.run().ok());
+        } catch (const std::exception&) {
+            run_threw.store(true);
+        }
+    });
+
+    // Barrier: a served connection proves the accept loop is running, so run()
+    // is waiting for it when stop() is called.
+    Socket peer;
+    const bool connected = connect_to("127.0.0.1", server.port(), peer, 5000).ok();
+    while (connected && server.active_connections() == 0) {
+        std::this_thread::yield();
+    }
+
+    PEF_PHASE(ctx, STOP);
+    bool stop_threw = false;
+    bool stop_ok = false;
+    try {
+        stop_ok = server.stop().ok();
+    } catch (const std::exception&) {
+        stop_threw = true;
+    }
+    runner.join();
+    peer.close();
+
+    PEF_PHASE(ctx, VERIFY);
+    PEF_CHECK(ctx, connected);
+    PEF_CHECK(ctx, !stop_threw);
+    PEF_CHECK(ctx, stop_ok);
+    PEF_CHECK(ctx, !run_threw.load());
+    PEF_CHECK(ctx, run_ok.load());
+    PEF_CHECK(ctx, server.accept_loop_finished());
+    PEF_CHECK(ctx, server.active_connections() == 0);
 }
